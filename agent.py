@@ -1,7 +1,7 @@
 import time
 from pathlib import Path
 
-OBS_RECORDINGS_DIR = Path(r"C:\OBS\Recordings")  # <-- путь поменяем позже аккуратно
+OBS_RECORDINGS_DIR = Path(r"C:\Users\User\Videos\Episoden_Raw_Recordings\01_mkv_in")
 CHECK_INTERVAL_SECONDS = 5
 
 
