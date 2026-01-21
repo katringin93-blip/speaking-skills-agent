@@ -2,7 +2,7 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
@@ -20,10 +20,10 @@ jobs:
 
       - name: Install PyInstaller
         run: pip install pyinstaller
- 
-       - name: Install dependencies
+
+      - name: Install dependencies
         run: pip install -r requirements.txt
-        
+
       - name: Build exe
         run: pyinstaller --onefile --name SpeakingSkillsAgent agent.py
 
@@ -32,3 +32,4 @@ jobs:
         with:
           name: SpeakingSkillsAgent-windows-exe
           path: dist/SpeakingSkillsAgent.exe
+
