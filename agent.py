@@ -124,4 +124,32 @@ def extract_audio(ffmpeg: Path, input_video: Path, output_wav: Path):
 
 def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {ap
+
+    headers = {
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    files = {
+        "file": (wav_path.name, wav_path.open("rb"), "audio/wav"),
+    }
+
+    data = {
+        "model": "gpt-4o-transcribe-diarize",
+        "response_format": "diarized_json",
+    }
+
+    r = requests.post(
+        url,
+        headers=headers,
+        files=files,
+        data=data,
+        timeout=600
+    )
+
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Transcription error {r.status_code}: {r.text}"
+        )
+
+    return r.json()
+
