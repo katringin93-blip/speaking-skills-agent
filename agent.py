@@ -3,7 +3,6 @@ import time
 import shutil
 import subprocess
 import json
-import hashlib
 from pathlib import Path
 
 import yaml
@@ -13,6 +12,7 @@ import requests
 CHECK_INTERVAL_SECONDS = 2
 STABLE_SECONDS_DEFAULT = 10
 STABLE_POLL_INTERVAL = 1
+PRIMARY_CONFIDENCE_MIN_SHARE = 0.15  # if top speaker is not ahead by this share, mark low confidence
 
 
 # ---------- helpers ----------
@@ -110,44 +110,12 @@ def extract_audio(ffmpeg: Path, input_video: Path, output_wav: Path):
         raise RuntimeError(f"ffmpeg failed:\n{r.stderr}")
 
 
-def sha256_file(p: Path) -> str:
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+# ---------- OpenAI Speech-to-Text (diarized) ----------
 
-
-# ---------- OpenAI Audio Transcriptions API ----------
-
-def transcribe_verbose_json_whisper1(api_key: str, wav_path: Path, language: str) -> dict:
+def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     """
-    Whisper-1 with segment timestamps.
-    """
-    url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    files = {
-        "file": (wav_path.name, wav_path.open("rb"), "audio/wav"),
-    }
-
-    data = {
-        "model": "whisper-1",
-        "language": language,
-        "response_format": "verbose_json",
-        "timestamp_granularities[]": "segment",
-    }
-
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=300)
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
-
-    return r.json()
-
-
-def transcribe_diarized_json(api_key: str, wav_path: Path, language: str) -> dict:
-    """
-    gpt-4o-transcribe-diarize with diarized_json (speaker labels + segments).
+    Uses OpenAI Audio Transcriptions endpoint with diarization-capable model.
+    Returns diarized_json (segments with speaker labels).
     """
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -158,46 +126,114 @@ def transcribe_diarized_json(api_key: str, wav_path: Path, language: str) -> dic
 
     data = {
         "model": "gpt-4o-transcribe-diarize",
-        "language": language,
         "response_format": "diarized_json",
     }
 
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=300)
+    r = requests.post(url, headers=headers, files=files, data=data, timeout=600)
     if r.status_code != 200:
-        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
-
+        raise RuntimeError(f"Transcribe (diarize) API error {r.status_code}: {r.text}")
     return r.json()
 
 
-def format_segments_verbose_to_text(verbose: dict) -> str:
-    """
-    [00.00-03.21] text
-    """
-    segments = verbose.get("segments") or []
-    lines = []
-    for s in segments:
-        start = float(s.get("start", 0.0))
-        end = float(s.get("end", 0.0))
-        text = (s.get("text") or "").strip()
-        if text:
-            lines.append(f"[{start:0.2f}-{end:0.2f}] {text}")
-    return "\n".join(lines).strip()
+def _segment_speaker_label(seg: dict) -> str:
+    return seg.get("speaker") or seg.get("speaker_label") or seg.get("speaker_id") or "UNKNOWN"
 
 
-def format_segments_diarized_to_text(diarized: dict) -> str:
-    """
-    [00.00-03.21] Speaker A: text
-    """
+def _segment_times(seg: dict) -> tuple[float, float]:
+    try:
+        start = float(seg.get("start", 0.0))
+    except Exception:
+        start = 0.0
+    try:
+        end = float(seg.get("end", start))
+    except Exception:
+        end = start
+    if end < start:
+        end = start
+    return start, end
+
+
+def diarized_json_to_text(diarized: dict) -> str:
     segments = diarized.get("segments") or []
     lines = []
     for s in segments:
-        start = float(s.get("start", 0.0))
-        end = float(s.get("end", 0.0))
-        speaker = (s.get("speaker") or "Speaker ?").strip()
+        start, end = _segment_times(s)
+        speaker = _segment_speaker_label(s)
         text = (s.get("text") or "").strip()
-        if text:
-            lines.append(f"[{start:0.2f}-{end:0.2f}] {speaker}: {text}")
+        lines.append(f"[{start:0.2f}-{end:0.2f}] {speaker}: {text}")
     return "\n".join(lines).strip()
+
+
+# ---------- Primary speaker selection ----------
+
+def compute_speaker_stats(diarized: dict) -> dict:
+    segments = diarized.get("segments") or []
+    stats = {}  # speaker -> {"duration": float, "segments": int}
+    for s in segments:
+        speaker = _segment_speaker_label(s)
+        start, end = _segment_times(s)
+        dur = max(0.0, end - start)
+        if speaker not in stats:
+            stats[speaker] = {"duration_seconds": 0.0, "segments": 0}
+        stats[speaker]["duration_seconds"] += dur
+        stats[speaker]["segments"] += 1
+    total = sum(v["duration_seconds"] for v in stats.values()) or 0.0
+    return {"by_speaker": stats, "total_duration_seconds": total}
+
+
+def choose_primary_speaker(stats: dict) -> dict:
+    by_speaker = stats.get("by_speaker") or {}
+    items = []
+    for spk, v in by_speaker.items():
+        items.append((spk, float(v.get("duration_seconds", 0.0)), int(v.get("segments", 0))))
+    items.sort(key=lambda x: x[1], reverse=True)
+
+    if not items:
+        return {"primary_speaker": "UNKNOWN", "confidence": "none", "reason": "no_segments"}
+
+    top = items[0]
+    second = items[1] if len(items) > 1 else ("NONE", 0.0, 0)
+
+    top_dur = top[1]
+    second_dur = second[1]
+    total = float(stats.get("total_duration_seconds", 0.0)) or 0.0
+
+    # Simple confidence: top speaker should be clearly ahead of second speaker by share of total
+    diff = top_dur - second_dur
+    diff_share = (diff / total) if total > 0 else 0.0
+
+    if diff_share >= PRIMARY_CONFIDENCE_MIN_SHARE:
+        conf = "high"
+    else:
+        conf = "low"
+
+    return {
+        "primary_speaker": top[0],
+        "confidence": conf,
+        "top_duration_seconds": round(top_dur, 3),
+        "second_duration_seconds": round(second_dur, 3),
+        "total_duration_seconds": round(total, 3),
+        "diff_share": round(diff_share, 4),
+        "ranking": [{"speaker": spk, "duration_seconds": round(dur, 3), "segments": segs} for spk, dur, segs in items],
+    }
+
+
+def write_primary_and_context(diarized: dict, primary_label: str, out_primary: Path, out_context: Path):
+    segments = diarized.get("segments") or []
+    primary_lines = []
+    context_lines = []
+    for s in segments:
+        start, end = _segment_times(s)
+        speaker = _segment_speaker_label(s)
+        text = (s.get("text") or "").strip()
+        line = f"[{start:0.2f}-{end:0.2f}] {speaker}: {text}"
+        if speaker == primary_label:
+            primary_lines.append(line)
+        else:
+            context_lines.append(line)
+
+    out_primary.write_text("\n".join(primary_lines).strip(), encoding="utf-8")
+    out_context.write_text("\n".join(context_lines).strip(), encoding="utf-8")
 
 
 # ---------- main ----------
@@ -209,10 +245,7 @@ def main():
     sessions_root = Path(get_required_str(config, "paths.sessions_dir"))
     stable_seconds = get_optional_int(config, "processing.stable_seconds", STABLE_SECONDS_DEFAULT)
 
-    # Один ключ на оба запроса (raw + diarized)
     api_key = get_required_str(config, "whisper_api.api_key")
-    language = get_required_str(config, "whisper_api.language")
-
     ffmpeg = resolve_ffmpeg(config)
 
     print("SpeakingSkillsAgent: started")
@@ -237,17 +270,15 @@ def main():
                     continue
 
                 session_dir = make_session_dir(sessions_root)
-
                 input_copy = session_dir / "input.mkv"
                 wav_path = session_dir / "audio.wav"
 
-                raw_txt_path = session_dir / "transcript_raw.txt"
-                raw_json_path = session_dir / "transcript_raw.json"
-
-                diar_txt_path = session_dir / "transcript_diarized.txt"
                 diar_json_path = session_dir / "transcript_diarized.json"
+                diar_txt_path = session_dir / "transcript_diarized.txt"
 
-                manifest_path = session_dir / "session_manifest.json"
+                stats_path = session_dir / "speaker_stats.json"
+                primary_txt = session_dir / "transcript_primary.txt"
+                context_txt = session_dir / "transcript_context.txt"
 
                 print(f"[COPY] -> {input_copy}")
                 shutil.copy2(f, input_copy)
@@ -255,84 +286,26 @@ def main():
                 print(f"[AUDIO] extracting -> {wav_path}")
                 extract_audio(ffmpeg, input_copy, wav_path)
 
-                # hashes for serialization / traceability
-                input_sha = sha256_file(input_copy)
-                wav_sha = sha256_file(wav_path)
+                print("[TRANSCRIBE] diarized transcription via API...")
+                diarized = openai_transcribe_diarized(api_key, wav_path)
 
-                # --- Raw transcript (immutable source-of-truth) ---
-                print("[ASR:RAW] whisper-1 verbose_json (segments + timestamps)...")
-                raw_verbose = transcribe_verbose_json_whisper1(api_key, wav_path, language)
+                diar_json_path.write_text(json.dumps(diarized, ensure_ascii=False, indent=2), encoding="utf-8")
+                diar_txt_path.write_text(diarized_json_to_text(diarized), encoding="utf-8")
 
-                raw_json_path.write_text(
-                    json.dumps(raw_verbose, ensure_ascii=False, indent=2),
-                    encoding="utf-8"
-                )
-                raw_txt_path.write_text(format_segments_verbose_to_text(raw_verbose), encoding="utf-8")
+                stats = compute_speaker_stats(diarized)
+                choice = choose_primary_speaker(stats)
 
-                # --- Diarized transcript (speaker labels) ---
-                print("[ASR:DIARIZED] gpt-4o-transcribe-diarize diarized_json (speaker labels)...")
-                diarized = transcribe_diarized_json(api_key, wav_path, language)
-
-                diar_json_path.write_text(
-                    json.dumps(diarized, ensure_ascii=False, indent=2),
-                    encoding="utf-8"
-                )
-                diar_txt_path.write_text(format_segments_diarized_to_text(diarized), encoding="utf-8")
-
-                # --- Session manifest (serialization) ---
-                manifest = {
-                    "session_id": session_dir.name,
-                    "created_at_local": session_dir.name,  # same as folder timestamp
-                    "source": {
-                        "obs_filename": f.name,
-                        "obs_full_path": str(f),
-                        "input_mkv": str(input_copy),
-                        "audio_wav": str(wav_path),
-                        "sha256": {
-                            "input_mkv": input_sha,
-                            "audio_wav": wav_sha
-                        }
-                    },
-                    "config": {
-                        "language": language
-                    },
-                    "asr": {
-                        "raw": {
-                            "model": "whisper-1",
-                            "response_format": "verbose_json",
-                            "files": {
-                                "json": raw_json_path.name,
-                                "txt": raw_txt_path.name
-                            }
-                        },
-                        "diarized": {
-                            "model": "gpt-4o-transcribe-diarize",
-                            "response_format": "diarized_json",
-                            "files": {
-                                "json": diar_json_path.name,
-                                "txt": diar_txt_path.name
-                            }
-                        }
-                    },
-                    "artifacts": [
-                        input_copy.name,
-                        wav_path.name,
-                        raw_json_path.name,
-                        raw_txt_path.name,
-                        diar_json_path.name,
-                        diar_txt_path.name
-                    ]
+                stats_out = {
+                    "primary_selection": choice,
+                    "stats": stats,
                 }
+                stats_path.write_text(json.dumps(stats_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
-                manifest_path.write_text(
-                    json.dumps(manifest, ensure_ascii=False, indent=2),
-                    encoding="utf-8"
-                )
+                primary_label = choice.get("primary_speaker", "UNKNOWN")
+                write_primary_and_context(diarized, primary_label, primary_txt, context_txt)
 
-                print(f"[DONE] session -> {session_dir}")
-                print(f"       saved -> {raw_txt_path.name}, {raw_json_path.name}")
-                print(f"       saved -> {diar_txt_path.name}, {diar_json_path.name}")
-                print(f"       saved -> {manifest_path.name}")
+                print(f"[PRIMARY] {primary_label} (confidence: {choice.get('confidence')}, diff_share: {choice.get('diff_share')})")
+                print(f"[DONE] saved -> {diar_txt_path.name}, {stats_path.name}, {primary_txt.name}, {context_txt.name}")
                 print("-----")
 
                 seen.add(f)
