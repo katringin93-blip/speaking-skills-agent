@@ -12,7 +12,6 @@ import requests
 CHECK_INTERVAL_SECONDS = 2
 STABLE_SECONDS_DEFAULT = 10
 STABLE_POLL_INTERVAL = 1
-PRIMARY_CONFIDENCE_MIN_SHARE = 0.15
 
 
 # ---------- helpers ----------
@@ -125,31 +124,101 @@ def extract_audio(ffmpeg: Path, input_video: Path, output_wav: Path):
 def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     url = "https://api.openai.com/v1/audio/transcriptions"
 
-    headers = {
-        "Authorization": f"Bearer {api_key}"
-    }
+    headers = {"Authorization": f"Bearer {api_key}"}
 
-    files = {
-        "file": (wav_path.name, wav_path.open("rb"), "audio/wav"),
-    }
+    files = {"file": (wav_path.name, wav_path.open("rb"), "audio/wav")}
 
     data = {
         "model": "gpt-4o-transcribe-diarize",
         "response_format": "diarized_json",
     }
 
-    r = requests.post(
-        url,
-        headers=headers,
-        files=files,
-        data=data,
-        timeout=600
-    )
-
+    r = requests.post(url, headers=headers, files=files, data=data, timeout=600)
     if r.status_code != 200:
-        raise RuntimeError(
-            f"Transcription error {r.status_code}: {r.text}"
-        )
-
+        raise RuntimeError(f"Transcription error {r.status_code}: {r.text}")
     return r.json()
 
+
+def diarized_json_to_text(diarized: dict) -> str:
+    segments = diarized.get("segments") or []
+    lines = []
+    for s in segments:
+        try:
+            start = float(s.get("start", 0.0))
+        except Exception:
+            start = 0.0
+        try:
+            end = float(s.get("end", start))
+        except Exception:
+            end = start
+
+        speaker = s.get("speaker") or s.get("speaker_label") or s.get("speaker_id") or "UNKNOWN"
+        text = (s.get("text") or "").strip()
+        lines.append(f"[{start:0.2f}-{end:0.2f}] {speaker}: {text}")
+    return "\n".join(lines).strip()
+
+
+def main():
+    print("SpeakingSkillsAgent: started")
+    config = load_config()
+
+    obs_dir = Path(get_required_str(config, "paths.obs_recordings_dir"))
+    sessions_root = Path(get_required_str(config, "paths.sessions_dir"))
+    stable_seconds = get_optional_int(config, "processing.stable_seconds", STABLE_SECONDS_DEFAULT)
+
+    api_key = get_required_str(config, "whisper_api.api_key")
+    ffmpeg = resolve_ffmpeg(config)
+
+    print(f"Base dir: {app_base_dir()}")
+    print(f"Watching OBS: {obs_dir}")
+    print(f"Sessions: {sessions_root}")
+    print(f"Stable seconds: {stable_seconds}")
+    print("-----")
+    print("Waiting for recordings...")
+
+    seen = set()
+
+    while True:
+        if obs_dir.exists():
+            for f in obs_dir.iterdir():
+                if f.suffix.lower() != ".mkv" or f in seen:
+                    continue
+
+                print(f"\n[FOUND] {f.name} -> waiting to stabilize...")
+                if not is_file_stable(f, stable_seconds):
+                    print("[SKIP] file not stable")
+                    seen.add(f)
+                    continue
+
+                session_dir = make_session_dir(sessions_root)
+                input_copy = session_dir / "input.mkv"
+                wav_path = session_dir / "audio.wav"
+
+                diar_json_path = session_dir / "transcript_diarized.json"
+                diar_txt_path = session_dir / "transcript_diarized.txt"
+
+                print(f"[COPY] -> {input_copy}")
+                shutil.copy2(f, input_copy)
+
+                print(f"[AUDIO] extracting -> {wav_path}")
+                extract_audio(ffmpeg, input_copy, wav_path)
+
+                print("[TRANSCRIBE] diarized transcription via API...")
+                diarized = openai_transcribe_diarized(api_key, wav_path)
+
+                diar_json_path.write_text(json.dumps(diarized, ensure_ascii=False, indent=2), encoding="utf-8")
+                diar_txt_path.write_text(diarized_json_to_text(diarized), encoding="utf-8")
+
+                print(f"[DONE] saved -> {diar_txt_path}")
+                seen.add(f)
+
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print("\n!!! ERROR OCCURRED !!!")
+        print(type(e).__name__ + ":", str(e))
+        pause_and_exit(1)
