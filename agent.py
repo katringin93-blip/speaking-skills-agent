@@ -3,6 +3,7 @@ import time
 import shutil
 import subprocess
 import json
+import hashlib
 from pathlib import Path
 
 import yaml
@@ -109,12 +110,19 @@ def extract_audio(ffmpeg: Path, input_video: Path, output_wav: Path):
         raise RuntimeError(f"ffmpeg failed:\n{r.stderr}")
 
 
-# ---------- Whisper API ----------
+def sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-def whisper_transcribe_verbose_json(api_key: str, wav_path: Path, language: str) -> dict:
+
+# ---------- OpenAI Audio Transcriptions API ----------
+
+def transcribe_verbose_json_whisper1(api_key: str, wav_path: Path, language: str) -> dict:
     """
-    OpenAI Speech-to-Text (Whisper) API with segment timestamps.
-    We request verbose_json + timestamp_granularities=segment.
+    Whisper-1 with segment timestamps.
     """
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -123,7 +131,6 @@ def whisper_transcribe_verbose_json(api_key: str, wav_path: Path, language: str)
         "file": (wav_path.name, wav_path.open("rb"), "audio/wav"),
     }
 
-    # timestamp_granularities requires verbose_json :contentReference[oaicite:1]{index=1}
     data = {
         "model": "whisper-1",
         "language": language,
@@ -133,16 +140,38 @@ def whisper_transcribe_verbose_json(api_key: str, wav_path: Path, language: str)
 
     r = requests.post(url, headers=headers, files=files, data=data, timeout=300)
     if r.status_code != 200:
-        raise RuntimeError(f"Whisper API error {r.status_code}: {r.text}")
+        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
 
     return r.json()
 
 
-def format_segments_to_text(verbose: dict) -> str:
+def transcribe_diarized_json(api_key: str, wav_path: Path, language: str) -> dict:
     """
-    Make a readable transcript with timestamps from segments.
-    Example line:
-    [00:12.34-00:18.90] text...
+    gpt-4o-transcribe-diarize with diarized_json (speaker labels + segments).
+    """
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    files = {
+        "file": (wav_path.name, wav_path.open("rb"), "audio/wav"),
+    }
+
+    data = {
+        "model": "gpt-4o-transcribe-diarize",
+        "language": language,
+        "response_format": "diarized_json",
+    }
+
+    r = requests.post(url, headers=headers, files=files, data=data, timeout=300)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
+
+    return r.json()
+
+
+def format_segments_verbose_to_text(verbose: dict) -> str:
+    """
+    [00.00-03.21] text
     """
     segments = verbose.get("segments") or []
     lines = []
@@ -150,7 +179,24 @@ def format_segments_to_text(verbose: dict) -> str:
         start = float(s.get("start", 0.0))
         end = float(s.get("end", 0.0))
         text = (s.get("text") or "").strip()
-        lines.append(f"[{start:0.2f}-{end:0.2f}] {text}")
+        if text:
+            lines.append(f"[{start:0.2f}-{end:0.2f}] {text}")
+    return "\n".join(lines).strip()
+
+
+def format_segments_diarized_to_text(diarized: dict) -> str:
+    """
+    [00.00-03.21] Speaker A: text
+    """
+    segments = diarized.get("segments") or []
+    lines = []
+    for s in segments:
+        start = float(s.get("start", 0.0))
+        end = float(s.get("end", 0.0))
+        speaker = (s.get("speaker") or "Speaker ?").strip()
+        text = (s.get("text") or "").strip()
+        if text:
+            lines.append(f"[{start:0.2f}-{end:0.2f}] {speaker}: {text}")
     return "\n".join(lines).strip()
 
 
@@ -163,6 +209,7 @@ def main():
     sessions_root = Path(get_required_str(config, "paths.sessions_dir"))
     stable_seconds = get_optional_int(config, "processing.stable_seconds", STABLE_SECONDS_DEFAULT)
 
+    # Один ключ на оба запроса (raw + diarized)
     api_key = get_required_str(config, "whisper_api.api_key")
     language = get_required_str(config, "whisper_api.language")
 
@@ -190,10 +237,17 @@ def main():
                     continue
 
                 session_dir = make_session_dir(sessions_root)
+
                 input_copy = session_dir / "input.mkv"
                 wav_path = session_dir / "audio.wav"
-                transcript_txt_path = session_dir / "transcript_raw.txt"
-                transcript_json_path = session_dir / "transcript_raw.json"
+
+                raw_txt_path = session_dir / "transcript_raw.txt"
+                raw_json_path = session_dir / "transcript_raw.json"
+
+                diar_txt_path = session_dir / "transcript_diarized.txt"
+                diar_json_path = session_dir / "transcript_diarized.json"
+
+                manifest_path = session_dir / "session_manifest.json"
 
                 print(f"[COPY] -> {input_copy}")
                 shutil.copy2(f, input_copy)
@@ -201,19 +255,84 @@ def main():
                 print(f"[AUDIO] extracting -> {wav_path}")
                 extract_audio(ffmpeg, input_copy, wav_path)
 
-                print("[WHISPER] transcribing via API (segments + timestamps)...")
-                verbose = whisper_transcribe_verbose_json(api_key, wav_path, language)
+                # hashes for serialization / traceability
+                input_sha = sha256_file(input_copy)
+                wav_sha = sha256_file(wav_path)
 
-                # Save raw verbose json (source of truth)
-                transcript_json_path.write_text(
-                    json.dumps(verbose, ensure_ascii=False, indent=2),
+                # --- Raw transcript (immutable source-of-truth) ---
+                print("[ASR:RAW] whisper-1 verbose_json (segments + timestamps)...")
+                raw_verbose = transcribe_verbose_json_whisper1(api_key, wav_path, language)
+
+                raw_json_path.write_text(
+                    json.dumps(raw_verbose, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+                raw_txt_path.write_text(format_segments_verbose_to_text(raw_verbose), encoding="utf-8")
+
+                # --- Diarized transcript (speaker labels) ---
+                print("[ASR:DIARIZED] gpt-4o-transcribe-diarize diarized_json (speaker labels)...")
+                diarized = transcribe_diarized_json(api_key, wav_path, language)
+
+                diar_json_path.write_text(
+                    json.dumps(diarized, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+                diar_txt_path.write_text(format_segments_diarized_to_text(diarized), encoding="utf-8")
+
+                # --- Session manifest (serialization) ---
+                manifest = {
+                    "session_id": session_dir.name,
+                    "created_at_local": session_dir.name,  # same as folder timestamp
+                    "source": {
+                        "obs_filename": f.name,
+                        "obs_full_path": str(f),
+                        "input_mkv": str(input_copy),
+                        "audio_wav": str(wav_path),
+                        "sha256": {
+                            "input_mkv": input_sha,
+                            "audio_wav": wav_sha
+                        }
+                    },
+                    "config": {
+                        "language": language
+                    },
+                    "asr": {
+                        "raw": {
+                            "model": "whisper-1",
+                            "response_format": "verbose_json",
+                            "files": {
+                                "json": raw_json_path.name,
+                                "txt": raw_txt_path.name
+                            }
+                        },
+                        "diarized": {
+                            "model": "gpt-4o-transcribe-diarize",
+                            "response_format": "diarized_json",
+                            "files": {
+                                "json": diar_json_path.name,
+                                "txt": diar_txt_path.name
+                            }
+                        }
+                    },
+                    "artifacts": [
+                        input_copy.name,
+                        wav_path.name,
+                        raw_json_path.name,
+                        raw_txt_path.name,
+                        diar_json_path.name,
+                        diar_txt_path.name
+                    ]
+                }
+
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
                     encoding="utf-8"
                 )
 
-                # Save readable text with timestamps
-                transcript_txt_path.write_text(format_segments_to_text(verbose), encoding="utf-8")
-
-                print(f"[DONE] saved -> {transcript_txt_path.name} and {transcript_json_path.name}")
+                print(f"[DONE] session -> {session_dir}")
+                print(f"       saved -> {raw_txt_path.name}, {raw_json_path.name}")
+                print(f"       saved -> {diar_txt_path.name}, {diar_json_path.name}")
+                print(f"       saved -> {manifest_path.name}")
                 print("-----")
 
                 seen.add(f)
