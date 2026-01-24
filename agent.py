@@ -2,6 +2,7 @@ import sys
 import time
 import shutil
 import subprocess
+import json
 from pathlib import Path
 
 import yaml
@@ -76,12 +77,15 @@ def resolve_ffmpeg(config: dict) -> Path:
             return p
     except Exception:
         pass
+
     local = app_base_dir() / "ffmpeg.exe"
     if local.exists():
         return local
+
     which = shutil.which("ffmpeg")
     if which:
         return Path(which)
+
     raise FileNotFoundError("ffmpeg not found. Put ffmpeg.exe next to the exe or set paths.ffmpeg_path.")
 
 
@@ -107,27 +111,47 @@ def extract_audio(ffmpeg: Path, input_video: Path, output_wav: Path):
 
 # ---------- Whisper API ----------
 
-def whisper_transcribe(api_key: str, wav_path: Path, language: str) -> str:
+def whisper_transcribe_verbose_json(api_key: str, wav_path: Path, language: str) -> dict:
     """
-    Uses OpenAI Speech-to-Text (Whisper) API.
-    Returns plain text transcript.
+    OpenAI Speech-to-Text (Whisper) API with segment timestamps.
+    We request verbose_json + timestamp_granularities=segment.
     """
     url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+
     files = {
         "file": (wav_path.name, wav_path.open("rb"), "audio/wav"),
     }
+
+    # timestamp_granularities requires verbose_json :contentReference[oaicite:1]{index=1}
     data = {
         "model": "whisper-1",
         "language": language,
-        "response_format": "text",
+        "response_format": "verbose_json",
+        "timestamp_granularities[]": "segment",
     }
+
     r = requests.post(url, headers=headers, files=files, data=data, timeout=300)
     if r.status_code != 200:
         raise RuntimeError(f"Whisper API error {r.status_code}: {r.text}")
-    return r.text
+
+    return r.json()
+
+
+def format_segments_to_text(verbose: dict) -> str:
+    """
+    Make a readable transcript with timestamps from segments.
+    Example line:
+    [00:12.34-00:18.90] text...
+    """
+    segments = verbose.get("segments") or []
+    lines = []
+    for s in segments:
+        start = float(s.get("start", 0.0))
+        end = float(s.get("end", 0.0))
+        text = (s.get("text") or "").strip()
+        lines.append(f"[{start:0.2f}-{end:0.2f}] {text}")
+    return "\n".join(lines).strip()
 
 
 # ---------- main ----------
@@ -168,7 +192,8 @@ def main():
                 session_dir = make_session_dir(sessions_root)
                 input_copy = session_dir / "input.mkv"
                 wav_path = session_dir / "audio.wav"
-                transcript_path = session_dir / "transcript_raw.txt"
+                transcript_txt_path = session_dir / "transcript_raw.txt"
+                transcript_json_path = session_dir / "transcript_raw.json"
 
                 print(f"[COPY] -> {input_copy}")
                 shutil.copy2(f, input_copy)
@@ -176,11 +201,19 @@ def main():
                 print(f"[AUDIO] extracting -> {wav_path}")
                 extract_audio(ffmpeg, input_copy, wav_path)
 
-                print("[WHISPER] transcribing via API...")
-                text = whisper_transcribe(api_key, wav_path, language)
+                print("[WHISPER] transcribing via API (segments + timestamps)...")
+                verbose = whisper_transcribe_verbose_json(api_key, wav_path, language)
 
-                transcript_path.write_text(text, encoding="utf-8")
-                print(f"[DONE] transcript saved -> {transcript_path}")
+                # Save raw verbose json (source of truth)
+                transcript_json_path.write_text(
+                    json.dumps(verbose, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+
+                # Save readable text with timestamps
+                transcript_txt_path.write_text(format_segments_to_text(verbose), encoding="utf-8")
+
+                print(f"[DONE] saved -> {transcript_txt_path.name} and {transcript_json_path.name}")
                 print("-----")
 
                 seen.add(f)
