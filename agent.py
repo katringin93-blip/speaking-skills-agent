@@ -14,6 +14,7 @@ STABLE_SECONDS_DEFAULT = 10
 STABLE_POLL_INTERVAL = 1
 
 PRIMARY_CONFIDENCE_MIN_SHARE = 0.15  # если top не впереди хотя бы на 15% от total -> low confidence
+MAX_TRANSCRIPT_CHARS_FOR_ANALYSIS = 14000  # чтобы не упираться в лимиты
 
 
 # ---------- helpers ----------
@@ -70,6 +71,17 @@ def get_required_str(data: dict, dotted_key: str) -> str:
     return cur.strip()
 
 
+def get_optional_str(data: dict, dotted_key: str, default: str) -> str:
+    cur = data
+    for p in dotted_key.split("."):
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    if not isinstance(cur, str) or not cur.strip():
+        return default
+    return cur.strip()
+
+
 def get_optional_int(data: dict, dotted_key: str, default: int) -> int:
     cur = data
     for p in dotted_key.split("."):
@@ -80,6 +92,19 @@ def get_optional_int(data: dict, dotted_key: str, default: int) -> int:
         return int(cur)
     except Exception:
         return default
+
+
+def get_optional_bool(data: dict, dotted_key: str, default: bool) -> bool:
+    cur = data
+    for p in dotted_key.split("."):
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    if isinstance(cur, bool):
+        return cur
+    if isinstance(cur, str):
+        return cur.strip().lower() in ("1", "true", "yes", "y", "on")
+    return default
 
 
 def resolve_ffmpeg(config: dict) -> Path:
@@ -121,21 +146,31 @@ def extract_audio(ffmpeg: Path, input_video: Path, output_wav: Path):
         raise RuntimeError(f"ffmpeg failed:\n{r.stderr}")
 
 
+def read_text_safe(p: Path) -> str:
+    if not p.exists():
+        return ""
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def clip_text(s: str, max_chars: int) -> str:
+    s = s or ""
+    if len(s) <= max_chars:
+        return s
+    # берём хвост, т.к. часто начало — приветствия, а суть позже
+    return "…(clipped)…\n" + s[-max_chars:]
+
+
 # ---------- OpenAI diarized transcription ----------
 
 def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     url = "https://api.openai.com/v1/audio/transcriptions"
-
     headers = {"Authorization": f"Bearer {api_key}"}
-
     files = {"file": (wav_path.name, wav_path.open("rb"), "audio/wav")}
-
     data = {
         "model": "gpt-4o-transcribe-diarize",
         "response_format": "diarized_json",
         "chunking_strategy": "auto",
     }
-
     r = requests.post(url, headers=headers, files=files, data=data, timeout=600)
     if r.status_code != 200:
         raise RuntimeError(f"Transcription error {r.status_code}: {r.text}")
@@ -175,7 +210,7 @@ def diarized_json_to_text(diarized: dict) -> str:
 
 def compute_speaker_stats(diarized: dict) -> dict:
     segments = diarized.get("segments") or []
-    stats = {}  # speaker -> {"duration_seconds": float, "segments": int}
+    stats = {}
     for s in segments:
         spk = _seg_speaker(s)
         start, end = _seg_times(s)
@@ -234,6 +269,146 @@ def write_primary_and_context(diarized: dict, primary_label: str, out_primary: P
     out_context.write_text("\n".join(context_lines).strip(), encoding="utf-8")
 
 
+# ---------- OpenAI text analysis (Responses API) ----------
+
+def openai_responses_analyze(api_key: str, model: str, diarized_text: str, primary_text: str) -> dict:
+    """
+    Uses Responses API (recommended for new projects) to generate a structured JSON analysis.
+    """
+    url = "https://api.openai.com/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    prompt = f"""
+You are an English-speaking coach. Analyze the conversation transcript.
+
+Rules:
+- Focus ONLY on the user's speech ("PRIMARY") for mistakes and improvements.
+- Use the full diarized transcript only for context.
+- Output MUST be valid JSON only. No markdown.
+
+Return JSON with this schema:
+{{
+  "session_summary": "1-3 sentences",
+  "topics": ["..."],
+  "primary_speaker_coaching": {{
+     "strengths": ["..."],
+     "top_issues": [
+        {{
+          "category": "grammar|vocabulary|clarity|fluency|pronunciation_proxy",
+          "example": "short quote from PRIMARY",
+          "better_version": "corrected sentence",
+          "why": "1 sentence"
+        }}
+     ],
+     "next_session_focus": ["... (max 3)"]
+  }},
+  "drills": [
+     {{
+       "name": "drill title",
+       "goal": "1 sentence",
+       "instructions": ["step 1", "step 2", "step 3"],
+       "examples": ["example 1", "example 2"]
+     }}
+  ]
+}}
+
+DIARIZED (for context):
+{diarized_text}
+
+PRIMARY (user only):
+{primary_text}
+""".strip()
+
+    payload = {
+        "model": model,
+        "input": prompt,
+    }
+
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"Responses API error {r.status_code}: {r.text}")
+
+    data = r.json()
+
+    # Responses API returns structured output blocks; easiest is output_text when present.
+    # But since we demanded JSON-only, we read `output_text` if available, otherwise fallback.
+    out_text = data.get("output_text")
+    if not out_text:
+        # fallback: try to extract from output items
+        out_text = ""
+        for item in data.get("output", []) or []:
+            for c in item.get("content", []) or []:
+                if c.get("type") == "output_text" and c.get("text"):
+                    out_text += c.get("text")
+
+    out_text = (out_text or "").strip()
+    if not out_text:
+        raise RuntimeError("Responses API returned no output_text")
+
+    try:
+        return json.loads(out_text)
+    except Exception:
+        # If model accidentally returned non-JSON, store raw for debugging
+        return {"_raw_output_text": out_text}
+
+
+def analysis_json_to_md(analysis: dict) -> str:
+    if "_raw_output_text" in analysis:
+        return "# Analysis (raw)\n\n" + analysis["_raw_output_text"]
+
+    lines = []
+    lines.append("# Session analysis")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append(analysis.get("session_summary", ""))
+    lines.append("")
+    lines.append("## Topics")
+    topics = analysis.get("topics") or []
+    for t in topics:
+        lines.append(f"- {t}")
+    lines.append("")
+    coach = analysis.get("primary_speaker_coaching") or {}
+
+    lines.append("## Strengths")
+    for s in (coach.get("strengths") or []):
+        lines.append(f"- {s}")
+    lines.append("")
+
+    lines.append("## Top issues (PRIMARY only)")
+    for it in (coach.get("top_issues") or []):
+        lines.append(f"- **{it.get('category','')}**")
+        lines.append(f"  - Example: {it.get('example','')}")
+        lines.append(f"  - Better: {it.get('better_version','')}")
+        lines.append(f"  - Why: {it.get('why','')}")
+    lines.append("")
+
+    lines.append("## Next session focus")
+    for f in (coach.get("next_session_focus") or []):
+        lines.append(f"- {f}")
+    lines.append("")
+
+    lines.append("## Drills")
+    for d in (analysis.get("drills") or []):
+        lines.append(f"### {d.get('name','')}")
+        lines.append(d.get("goal", ""))
+        lines.append("")
+        lines.append("Instructions:")
+        for st in (d.get("instructions") or []):
+            lines.append(f"- {st}")
+        ex = d.get("examples") or []
+        if ex:
+            lines.append("")
+            lines.append("Examples:")
+            for e in ex:
+                lines.append(f"- {e}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 # ---------- main ----------
 
 def main():
@@ -247,10 +422,14 @@ def main():
     api_key = get_required_str(config, "whisper_api.api_key")
     ffmpeg = resolve_ffmpeg(config)
 
+    analysis_enabled = get_optional_bool(config, "analysis.enabled", True)
+    analysis_model = get_optional_str(config, "analysis.model", "gpt-4o-mini")
+
     print(f"Base dir: {app_base_dir()}")
     print(f"Watching OBS: {obs_dir}")
     print(f"Sessions: {sessions_root}")
     print(f"Stable seconds: {stable_seconds}")
+    print(f"Analysis enabled: {analysis_enabled} (model: {analysis_model})")
     print("-----")
     print("Waiting for recordings...")
 
@@ -278,6 +457,9 @@ def main():
                 primary_txt = session_dir / "transcript_primary.txt"
                 context_txt = session_dir / "transcript_context.txt"
 
+                analysis_json_path = session_dir / "analysis.json"
+                analysis_md_path = session_dir / "analysis.md"
+
                 print(f"[COPY] -> {input_copy}")
                 shutil.copy2(f, input_copy)
 
@@ -293,18 +475,27 @@ def main():
                 stats = compute_speaker_stats(diarized)
                 choice = choose_primary_speaker(stats)
 
-                stats_out = {
-                    "primary_selection": choice,
-                    "stats": stats,
-                }
+                stats_out = {"primary_selection": choice, "stats": stats}
                 stats_path.write_text(json.dumps(stats_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
                 primary_label = choice.get("primary_speaker", "UNKNOWN")
                 write_primary_and_context(diarized, primary_label, primary_txt, context_txt)
 
                 print(f"[PRIMARY] {primary_label} (confidence: {choice.get('confidence')}, diff_share: {choice.get('diff_share')})")
-                print(f"[DONE] saved -> {diar_txt_path.name}, {stats_path.name}, {primary_txt.name}, {context_txt.name}")
 
+                if analysis_enabled:
+                    print("[ANALYSIS] generating session report via Responses API...")
+                    diarized_text = clip_text(read_text_safe(diar_txt_path), MAX_TRANSCRIPT_CHARS_FOR_ANALYSIS)
+                    primary_text = clip_text(read_text_safe(primary_txt), MAX_TRANSCRIPT_CHARS_FOR_ANALYSIS)
+
+                    analysis = openai_responses_analyze(api_key, analysis_model, diarized_text, primary_text)
+
+                    analysis_json_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+                    analysis_md_path.write_text(analysis_json_to_md(analysis), encoding="utf-8")
+
+                    print(f"[ANALYSIS] saved -> {analysis_md_path.name}, {analysis_json_path.name}")
+
+                print(f"[DONE] session saved -> {session_dir}")
                 seen.add(f)
 
         time.sleep(CHECK_INTERVAL_SECONDS)
