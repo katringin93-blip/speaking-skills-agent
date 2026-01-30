@@ -471,6 +471,38 @@ def telegram_send_document(bot_token: str, chat_id: int, file_path: Path, captio
 
 
 # ---------- main ----------
+def split_wav(ffmpeg: Path, wav_path: Path, out_dir: Path, minutes: int = 15) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_pattern = out_dir / "chunk_%03d.wav"
+    seg_seconds = minutes * 60
+
+    cmd = [
+        str(ffmpeg), "-y",
+        "-i", str(wav_path),
+        "-f", "segment",
+        "-segment_time", str(seg_seconds),
+        "-c", "copy",
+        str(out_pattern),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg split failed:\n{r.stderr}")
+
+    return sorted(out_dir.glob("chunk_*.wav"))
+
+
+def merge_diarized_chunks(chunk_results: list[dict], chunk_seconds: int) -> dict:
+    merged = {"segments": []}
+    for idx, d in enumerate(chunk_results):
+        offset = idx * chunk_seconds
+        for s in (d.get("segments") or []):
+            s2 = dict(s)
+            if "start" in s2:
+                s2["start"] = float(s2["start"]) + offset
+            if "end" in s2:
+                s2["end"] = float(s2["end"]) + offset
+            merged["segments"].append(s2)
+    return merged
 
 def main():
     print("SpeakingSkillsAgent: started")
@@ -535,7 +567,18 @@ def main():
                 extract_audio(ffmpeg, input_copy, wav_path)
 
                 print("[TRANSCRIBE] diarized transcription via API...")
-                diarized = openai_transcribe_diarized(api_key, wav_path)
+                chunk_minutes = 15
+chunk_dir = session_dir / "chunks"
+
+chunks = split_wav(ffmpeg, wav_path, chunk_dir, minutes=chunk_minutes)
+
+chunk_results = []
+for i, ch in enumerate(chunks, 1):
+    print(f"[TRANSCRIBE] chunk {i}/{len(chunks)}: {ch.name}")
+    chunk_results.append(openai_transcribe_diarized(api_key, ch))
+
+diarized = merge_diarized_chunks(chunk_results, chunk_seconds=chunk_minutes * 60)
+
                 diar_json_path.write_text(json.dumps(diarized, ensure_ascii=False, indent=2), encoding="utf-8")
                 diar_txt_path.write_text(diarized_json_to_text(diarized), encoding="utf-8")
 
