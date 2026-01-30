@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import json
 from pathlib import Path
+from typing import List, Dict, Tuple, Any
 
 import yaml
 import requests
@@ -160,6 +161,59 @@ def clip_text(s: str, max_chars: int) -> str:
     return "…(clipped)…\n" + s[-max_chars:]
 
 
+# ---------- NEW: chunking helpers (faster + more stable diarization on long sessions) ----------
+
+def split_wav(ffmpeg: Path, wav_path: Path, out_dir: Path, minutes: int = 15) -> List[Path]:
+    """
+    Splits wav into N chunks using ffmpeg segment muxer.
+    Returns list of chunk wav paths sorted by name.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_pattern = out_dir / "chunk_%03d.wav"
+    seg_seconds = minutes * 60
+
+    cmd = [
+        str(ffmpeg), "-y",
+        "-i", str(wav_path),
+        "-f", "segment",
+        "-segment_time", str(seg_seconds),
+        "-c", "copy",
+        str(out_pattern),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg split failed:\n{r.stderr}")
+
+    chunks = sorted(out_dir.glob("chunk_*.wav"))
+    if not chunks:
+        raise RuntimeError("ffmpeg split produced no chunks")
+    return chunks
+
+
+def merge_diarized_chunks(chunk_results: List[Dict[str, Any]], chunk_seconds: int) -> Dict[str, Any]:
+    """
+    Merges diarized_json segments from multiple chunks into a single diarized dict,
+    shifting start/end timestamps by chunk offset.
+    """
+    merged: Dict[str, Any] = {"segments": []}
+    for idx, d in enumerate(chunk_results):
+        offset = idx * chunk_seconds
+        for s in (d.get("segments") or []):
+            s2 = dict(s)
+            if "start" in s2:
+                try:
+                    s2["start"] = float(s2["start"]) + offset
+                except Exception:
+                    pass
+            if "end" in s2:
+                try:
+                    s2["end"] = float(s2["end"]) + offset
+                except Exception:
+                    pass
+            merged["segments"].append(s2)
+    return merged
+
+
 # ---------- OpenAI diarized transcription ----------
 
 def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
@@ -167,7 +221,6 @@ def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     headers = {"Authorization": f"Bearer {api_key}"}
 
     def _post(form_data: dict) -> requests.Response:
-        # важно: файл должен закрываться корректно
         with wav_path.open("rb") as fh:
             files = {"file": (wav_path.name, fh, "audio/wav")}
             return requests.post(url, headers=headers, files=files, data=form_data, timeout=3600)
@@ -198,12 +251,11 @@ def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     raise RuntimeError(f"Transcription error {r.status_code}: {r.text}")
 
 
-
 def _seg_speaker(seg: dict) -> str:
     return seg.get("speaker") or seg.get("speaker_label") or seg.get("speaker_id") or "UNKNOWN"
 
 
-def _seg_times(seg: dict) -> tuple[float, float]:
+def _seg_times(seg: dict) -> Tuple[float, float]:
     try:
         start = float(seg.get("start", 0.0))
     except Exception:
@@ -410,7 +462,6 @@ def analysis_json_to_md(analysis: dict) -> str:
 
 
 def build_telegram_message(session_dir: Path, analysis: dict) -> str:
-    # делаем короткое сообщение + ссылка-подсказка на папку сессии (путь)
     summary = ""
     topics = []
     focus = []
@@ -471,38 +522,6 @@ def telegram_send_document(bot_token: str, chat_id: int, file_path: Path, captio
 
 
 # ---------- main ----------
-def split_wav(ffmpeg: Path, wav_path: Path, out_dir: Path, minutes: int = 15) -> list[Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_pattern = out_dir / "chunk_%03d.wav"
-    seg_seconds = minutes * 60
-
-    cmd = [
-        str(ffmpeg), "-y",
-        "-i", str(wav_path),
-        "-f", "segment",
-        "-segment_time", str(seg_seconds),
-        "-c", "copy",
-        str(out_pattern),
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg split failed:\n{r.stderr}")
-
-    return sorted(out_dir.glob("chunk_*.wav"))
-
-
-def merge_diarized_chunks(chunk_results: list[dict], chunk_seconds: int) -> dict:
-    merged = {"segments": []}
-    for idx, d in enumerate(chunk_results):
-        offset = idx * chunk_seconds
-        for s in (d.get("segments") or []):
-            s2 = dict(s)
-            if "start" in s2:
-                s2["start"] = float(s2["start"]) + offset
-            if "end" in s2:
-                s2["end"] = float(s2["end"]) + offset
-            merged["segments"].append(s2)
-    return merged
 
 def main():
     print("SpeakingSkillsAgent: started")
@@ -566,18 +585,19 @@ def main():
                 print(f"[AUDIO] extracting -> {wav_path}")
                 extract_audio(ffmpeg, input_copy, wav_path)
 
-                print("[TRANSCRIBE] diarized transcription via API...")
+                # --- CHANGED: diarization is now chunked ---
+                print("[TRANSCRIBE] diarized transcription via API (chunked)...")
                 chunk_minutes = 15
-chunk_dir = session_dir / "chunks"
+                chunk_dir = session_dir / "chunks"
+                chunks = split_wav(ffmpeg, wav_path, chunk_dir, minutes=chunk_minutes)
 
-chunks = split_wav(ffmpeg, wav_path, chunk_dir, minutes=chunk_minutes)
+                chunk_results: List[Dict[str, Any]] = []
+                for i, ch in enumerate(chunks, 1):
+                    print(f"[TRANSCRIBE] chunk {i}/{len(chunks)}: {ch.name}")
+                    chunk_results.append(openai_transcribe_diarized(api_key, ch))
 
-chunk_results = []
-for i, ch in enumerate(chunks, 1):
-    print(f"[TRANSCRIBE] chunk {i}/{len(chunks)}: {ch.name}")
-    chunk_results.append(openai_transcribe_diarized(api_key, ch))
-
-diarized = merge_diarized_chunks(chunk_results, chunk_seconds=chunk_minutes * 60)
+                diarized = merge_diarized_chunks(chunk_results, chunk_seconds=chunk_minutes * 60)
+                # --- end changed ---
 
                 diar_json_path.write_text(json.dumps(diarized, ensure_ascii=False, indent=2), encoding="utf-8")
                 diar_txt_path.write_text(diarized_json_to_text(diarized), encoding="utf-8")
@@ -610,7 +630,6 @@ diarized = merge_diarized_chunks(chunk_results, chunk_seconds=chunk_minutes * 60
                         msg = build_telegram_message(session_dir, analysis or {})
                         telegram_send_message(tg_token, tg_chat_id, msg)
 
-                        # файлы — опционально
                         if tg_send_md and analysis_md_path.exists():
                             telegram_send_document(tg_token, tg_chat_id, analysis_md_path, caption="analysis.md")
                         if tg_send_json and analysis_json_path.exists():
