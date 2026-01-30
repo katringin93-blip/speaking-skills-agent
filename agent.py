@@ -136,7 +136,7 @@ def make_session_dir(root: Path) -> Path:
 
 
 def extract_audio(ffmpeg: Path, input_video: Path, output_audio: Path):
-    """Извлекает звук в MP3 для экономии места и обхода лимитов API"""
+    """Извлекает звук в MP3. Битрейт 48k позволяет вместить 1 час в 25 МБ."""
     output_path = output_audio.with_suffix('.mp3')
     cmd = [
         str(ffmpeg), "-y",
@@ -144,7 +144,7 @@ def extract_audio(ffmpeg: Path, input_video: Path, output_audio: Path):
         "-vn",
         "-ac", "1",
         "-ar", "16000",
-        "-b:a", "64k",  # Сжатие до 64kbps (идеально для голоса)
+        "-b:a", "48k",
         str(output_path)
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -175,18 +175,16 @@ def openai_transcribe_diarized(api_key: str, audio_path: Path) -> dict:
     size_mb = audio_path.stat().st_size / 1024 / 1024
     print(f"[TRANSCRIBE] -> POST {audio_path.name} ({size_mb:.1f} MB)")
 
-    # Подготовка данных формы
-    # Модели с диаризацией требуют chunking_strategy в виде JSON-объекта
+    # Исправлено на server_vad согласно требованиям API для длинных файлов
     data = {
         "model": "gpt-4o-transcribe-diarize",
         "response_format": "diarized_json",
-        "chunking_strategy": json.dumps({"type": "auto"})
+        "chunking_strategy": json.dumps({"type": "server_vad"})
     }
 
     with audio_path.open("rb") as fh:
         files = {"file": (audio_path.name, fh, "audio/mpeg")}
-        # Timeout 10 минут (600с) для загрузки и обработки
-        timeout = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
+        timeout = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
         
         with httpx.Client(timeout=timeout) as client:
             t_req = time.time()
@@ -292,7 +290,7 @@ def write_primary_and_context(diarized: dict, primary_label: str, out_primary: P
     out_context.write_text("\n".join(context_lines).strip(), encoding="utf-8")
 
 
-# ---------- OpenAI text analysis (Responses API) ----------
+# ---------- OpenAI text analysis ----------
 
 def openai_responses_analyze(api_key: str, model: str, diarized_text: str, primary_text: str) -> dict:
     url = "https://api.openai.com/v1/responses"
@@ -300,67 +298,42 @@ def openai_responses_analyze(api_key: str, model: str, diarized_text: str, prima
 
     prompt = f"""
 You are an English-speaking coach. Analyze the conversation transcript.
+Focus ONLY on PRIMARY for mistakes. Use DIARIZED for context.
+Output MUST be valid JSON only.
 
-Rules:
-- Focus ONLY on the user's speech ("PRIMARY") for mistakes and improvements.
-- Use the full diarized transcript only for context.
-- Output MUST be valid JSON only. No markdown.
-
-Return JSON with this schema:
+JSON schema:
 {{
-  "session_summary": "1-3 sentences",
+  "session_summary": "...",
   "topics": ["..."],
   "primary_speaker_coaching": {{
      "strengths": ["..."],
-     "top_issues": [
-        {{
-          "category": "grammar|vocabulary|clarity|fluency|pronunciation_proxy",
-          "example": "short quote from PRIMARY",
-          "better_version": "corrected sentence",
-          "why": "1 sentence"
-        }}
-     ],
-     "next_session_focus": ["... (max 3)"]
+     "top_issues": [ {{"category": "...", "example": "...", "better_version": "...", "why": "..."}} ],
+     "next_session_focus": ["..."]
   }},
-  "drills": [
-     {{
-       "name": "drill title",
-       "goal": "1 sentence",
-       "instructions": ["step 1", "step 2", "step 3"],
-       "examples": ["example 1", "example 2"]
-     }}
-  ]
+  "drills": [ {{"name": "...", "goal": "...", "instructions": ["..."], "examples": ["..."]}} ]
 }}
 
-DIARIZED (for context):
+DIARIZED:
 {diarized_text}
 
-PRIMARY (user only):
+PRIMARY:
 {primary_text}
 """.strip()
 
     payload = {"model": model, "input": prompt}
-
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=180)
     if r.status_code != 200:
-        raise RuntimeError(f"Responses API error {r.status_code}: {r.text}")
+        raise RuntimeError(f"Analysis error {r.status_code}: {r.text}")
 
     data = r.json()
-
-    out_text = data.get("output_text")
-    if not out_text:
-        out_text = ""
-        for item in data.get("output", []) or []:
-            for c in item.get("content", []) or []:
-                if c.get("type") == "output_text" and c.get("text"):
-                    out_text += c.get("text")
-
-    out_text = (out_text or "").strip()
-    if not out_text:
-        raise RuntimeError("Responses API returned no output_text")
+    out_text = ""
+    for item in data.get("output", []) or []:
+        for c in item.get("content", []) or []:
+            if c.get("type") == "output_text" and c.get("text"):
+                out_text += c.get("text")
 
     try:
-        return json.loads(out_text)
+        return json.loads(out_text.strip())
     except Exception:
         return {"_raw_output_text": out_text}
 
@@ -368,106 +341,30 @@ PRIMARY (user only):
 def analysis_json_to_md(analysis: dict) -> str:
     if "_raw_output_text" in analysis:
         return "# Analysis (raw)\n\n" + analysis["_raw_output_text"]
-
-    lines = []
-    lines.append("# Session analysis\n")
-    lines.append("## Summary")
-    lines.append(analysis.get("session_summary", ""))
-    lines.append("\n## Topics")
-    for t in (analysis.get("topics") or []):
-        lines.append(f"- {t}")
-
+    lines = ["# Session analysis\n", "## Summary", analysis.get("session_summary", ""), "\n## Topics"]
+    for t in (analysis.get("topics") or []): lines.append(f"- {t}")
     coach = analysis.get("primary_speaker_coaching") or {}
     lines.append("\n## Strengths")
-    for s in (coach.get("strengths") or []):
-        lines.append(f"- {s}")
-
-    lines.append("\n## Top issues (PRIMARY only)")
+    for s in (coach.get("strengths") or []): lines.append(f"- {s}")
+    lines.append("\n## Top issues")
     for it in (coach.get("top_issues") or []):
-        lines.append(f"- **{it.get('category','')}**")
-        lines.append(f"  - Example: {it.get('example','')}")
-        lines.append(f"  - Better: {it.get('better_version','')}")
-        lines.append(f"  - Why: {it.get('why','')}")
-
-    lines.append("\n## Next session focus")
-    for f in (coach.get("next_session_focus") or []):
-        lines.append(f"- {f}")
-
-    lines.append("\n## Drills")
-    for d in (analysis.get("drills") or []):
-        lines.append(f"### {d.get('name','')}")
-        lines.append(d.get("goal", ""))
-        lines.append("Instructions:")
-        for st in (d.get("instructions") or []):
-            lines.append(f"- {st}")
-        ex = d.get("examples") or []
-        if ex:
-            lines.append("Examples:")
-            for e in ex:
-                lines.append(f"- {e}")
-        lines.append("")
-
+        lines.append(f"- **{it.get('category','')}**\n  - Ex: {it.get('example','')}\n  - Better: {it.get('better_version','')}")
     return "\n".join(lines).strip()
 
 
 def build_telegram_message(session_dir: Path, analysis: dict) -> str:
-    summary = ""
-    topics = []
-    focus = []
-    if isinstance(analysis, dict) and "_raw_output_text" not in analysis:
-        summary = analysis.get("session_summary", "") or ""
-        topics = analysis.get("topics") or []
-        coach = analysis.get("primary_speaker_coaching") or {}
-        focus = coach.get("next_session_focus") or []
-
-    lines = []
-    lines.append("AI Speaking Skills — analysis ready")
-    if summary:
-        lines.append("")
-        lines.append("Summary:")
-        lines.append(summary)
-
-    if topics:
-        lines.append("")
-        lines.append("Topics:")
-        for t in topics[:6]:
-            lines.append(f"- {t}")
-
-    if focus:
-        lines.append("")
-        lines.append("Next focus:")
-        for f in focus[:3]:
-            lines.append(f"- {f}")
-
-    lines.append("")
-    lines.append(f"Session folder: {session_dir}")
-
-    text = "\n".join(lines).strip()
-    if len(text) > TELEGRAM_MAX_MESSAGE_LEN:
-        text = text[:TELEGRAM_MAX_MESSAGE_LEN - 20] + "\n…(clipped)…"
-    return text
+    summary = analysis.get("session_summary", "") if isinstance(analysis, dict) else ""
+    return f"AI Analysis ready\n\nSummary: {summary}\n\nFolder: {session_dir}"
 
 
 # ---------- Telegram ----------
 
 def telegram_send_message(bot_token: str, chat_id: int, text: str):
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    r = requests.post(url, json=payload, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"Telegram sendMessage error {r.status_code}: {r.text}")
-
+    requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=30)
 
 def telegram_send_document(bot_token: str, chat_id: int, file_path: Path, caption: str = ""):
-    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
     with file_path.open("rb") as f:
-        files = {"document": (file_path.name, f)}
-        data = {"chat_id": str(chat_id)}
-        if caption:
-            data["caption"] = caption[:1024]
-        r = requests.post(url, data=data, files=files, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"Telegram sendDocument error {r.status_code}: {r.text}")
+        requests.post(f"https://api.telegram.org/bot{bot_token}/sendDocument", data={"chat_id": chat_id, "caption": caption}, files={"document": f}, timeout=60)
 
 
 # ---------- main ----------
@@ -475,119 +372,55 @@ def telegram_send_document(bot_token: str, chat_id: int, file_path: Path, captio
 def main():
     print("SpeakingSkillsAgent: started")
     config = load_config()
-
     obs_dir = Path(get_required_str(config, "paths.obs_recordings_dir"))
     sessions_root = Path(get_required_str(config, "paths.sessions_dir"))
-    stable_seconds = get_optional_int(config, "processing.stable_seconds", STABLE_SECONDS_DEFAULT)
-
     api_key = get_required_str(config, "whisper_api.api_key")
     ffmpeg = resolve_ffmpeg(config)
 
-    analysis_enabled = get_optional_bool(config, "analysis.enabled", True)
-    analysis_model = get_optional_str(config, "analysis.model", "gpt-4o-mini")
-
-    tg_enabled = get_optional_bool(config, "telegram.enabled", False)
-    tg_token = get_optional_str(config, "telegram.bot_token", "")
-    tg_chat_id = get_optional_int(config, "telegram.chat_id", 0)
-    tg_send_md = get_optional_bool(config, "telegram.send_analysis_md", True)
-    tg_send_json = get_optional_bool(config, "telegram.send_analysis_json", False)
-
-    print(f"Base dir: {app_base_dir()}")
-    print(f"Watching OBS: {obs_dir}")
-    print(f"Sessions: {sessions_root}")
-    print(f"Stable seconds: {stable_seconds}")
-    print(f"Analysis enabled: {analysis_enabled} (model: {analysis_model})")
-    print(f"Telegram enabled: {tg_enabled}")
-    print("-----")
-    print("Waiting for recordings...")
-
     seen = set()
-
     while True:
         if obs_dir.exists():
             for f in obs_dir.iterdir():
-                if f.suffix.lower() not in (".mkv", ".mp4") or f in seen:
-                    continue
-
-                print(f"\n[FOUND] {f.name} -> waiting to stabilize...")
-                if not is_file_stable(f, stable_seconds):
-                    print("[SKIP] file not stable")
-                    seen.add(f)
-                    continue
+                if f.suffix.lower() not in (".mkv", ".mp4") or f in seen: continue
+                if not is_file_stable(f, 10): continue
 
                 session_dir = make_session_dir(sessions_root)
                 input_copy = session_dir / f"input{f.suffix}"
-
-                diar_json_path = session_dir / "transcript_diarized.json"
-                diar_txt_path = session_dir / "transcript_diarized.txt"
-                stats_path = session_dir / "speaker_stats.json"
-                primary_txt = session_dir / "transcript_primary.txt"
-                context_txt = session_dir / "transcript_context.txt"
-
-                analysis_json_path = session_dir / "analysis.json"
-                analysis_md_path = session_dir / "analysis.md"
-
-                print(f"[COPY] -> {input_copy}")
                 shutil.copy2(f, input_copy)
 
-                # 1. Извлекаем звук в MP3 (намного легче для API)
                 print(f"[AUDIO] extracting MP3...")
                 mp3_path = extract_audio(ffmpeg, input_copy, session_dir / "audio")
 
-                # 2. Транскрибируем ОДНИМ файлом (без чанкинга)
-                print("[TRANSCRIBE] diarized transcription via API...")
+                print("[TRANSCRIBE] diarized transcription...")
                 diarized = openai_transcribe_diarized(api_key, mp3_path)
+                
+                (session_dir / "transcript_diarized.json").write_text(json.dumps(diarized, ensure_ascii=False, indent=2), encoding="utf-8")
+                (session_dir / "transcript_diarized.txt").write_text(diarized_json_to_text(diarized), encoding="utf-8")
 
-                # Сохраняем результаты
-                diar_json_path.write_text(json.dumps(diarized, ensure_ascii=False, indent=2), encoding="utf-8")
-                diar_txt_path.write_text(diarized_json_to_text(diarized), encoding="utf-8")
-
-                # Статистика и выбор основного спикера
                 stats = compute_speaker_stats(diarized)
                 choice = choose_primary_speaker(stats)
-                stats_out = {"primary_selection": choice, "stats": stats}
-                stats_path.write_text(json.dumps(stats_out, ensure_ascii=False, indent=2), encoding="utf-8")
-
                 primary_label = choice.get("primary_speaker", "UNKNOWN")
-                write_primary_and_context(diarized, primary_label, primary_txt, context_txt)
-                print(f"[PRIMARY] {primary_label} (confidence: {choice.get('confidence')}, diff_share: {choice.get('diff_share')})")
+                write_primary_and_context(diarized, primary_label, session_dir / "transcript_primary.txt", session_dir / "transcript_context.txt")
 
-                # 3. Анализ текста
-                analysis = None
-                if analysis_enabled:
-                    print("[ANALYSIS] generating session report via Responses API...")
-                    diarized_text = clip_text(read_text_safe(diar_txt_path), MAX_TRANSCRIPT_CHARS_FOR_ANALYSIS)
-                    primary_text = clip_text(read_text_safe(primary_txt), MAX_TRANSCRIPT_CHARS_FOR_ANALYSIS)
+                if get_optional_bool(config, "analysis.enabled", True):
+                    analysis = openai_responses_analyze(api_key, get_optional_str(config, "analysis.model", "gpt-4o-mini"), 
+                                                       clip_text(read_text_safe(session_dir / "transcript_diarized.txt"), 14000),
+                                                       clip_text(read_text_safe(session_dir / "transcript_primary.txt"), 14000))
+                    (session_dir / "analysis.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+                    (session_dir / "analysis.md").write_text(analysis_json_to_md(analysis), encoding="utf-8")
 
-                    analysis = openai_responses_analyze(api_key, analysis_model, diarized_text, primary_text)
-                    analysis_json_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
-                    analysis_md_path.write_text(analysis_json_to_md(analysis), encoding="utf-8")
-                    print(f"[ANALYSIS] saved -> {analysis_md_path.name}")
+                    if get_optional_bool(config, "telegram.enabled", False):
+                        token = get_optional_str(config, "telegram.bot_token", "")
+                        cid = get_optional_int(config, "telegram.chat_id", 0)
+                        telegram_send_message(token, cid, build_telegram_message(session_dir, analysis))
+                        telegram_send_document(token, cid, session_dir / "analysis.md")
 
-                # 4. Telegram
-                if tg_enabled:
-                    if not tg_token or not tg_chat_id:
-                        print("[TELEGRAM] enabled but token/chat_id missing -> skip")
-                    else:
-                        print("[TELEGRAM] sending...")
-                        msg = build_telegram_message(session_dir, analysis or {})
-                        telegram_send_message(tg_token, tg_chat_id, msg)
-
-                        if tg_send_md and analysis_md_path.exists():
-                            telegram_send_document(tg_token, tg_chat_id, analysis_md_path, caption="analysis.md")
-                        if tg_send_json and analysis_json_path.exists():
-                            telegram_send_document(tg_token, tg_chat_id, analysis_json_path, caption="analysis.json")
-
-                print(f"[DONE] session saved -> {session_dir}")
+                print(f"[DONE] session: {session_dir}")
                 seen.add(f)
-
         time.sleep(CHECK_INTERVAL_SECONDS)
 
-
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except Exception as e:
-        print("\n!!! ERROR OCCURRED !!!")
-        print(type(e).__name__ + ":", str(e))
+        print(f"\n!!! ERROR: {e}")
         pause_and_exit(1)
