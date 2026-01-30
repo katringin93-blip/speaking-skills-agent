@@ -13,7 +13,7 @@ from pydub import AudioSegment
 
 # ---------- Константы ----------
 CHECK_INTERVAL_SECONDS = 2
-CHUNK_LENGTH_MS = 1200 * 1000  # 20 минут (лимит OpenAI 1400 сек)
+CHUNK_LENGTH_MS = 300 * 1000  # 5 минут (стабильно для API)
 
 # ---------- Помощники ----------
 
@@ -28,7 +28,6 @@ def pause_and_exit(code: int = 0):
 
 def load_config() -> dict:
     """Находит конфиг рядом с .exe или .py файлом"""
-    # Определяем путь к папке, где лежит запущенный файл
     if getattr(sys, 'frozen', False):
         base_path = Path(sys.executable).parent
     else:
@@ -36,7 +35,6 @@ def load_config() -> dict:
         
     cfg_path = base_path / "config.local.yaml"
     
-    # Если не нашли, проверяем текущую рабочую директорию
     if not cfg_path.exists():
         cfg_path = Path(os.getcwd()) / "config.local.yaml"
         
@@ -57,7 +55,7 @@ def extract_audio(ffmpeg: Path, input_video: Path, output_audio: Path):
     return output_path
 
 def slice_audio(audio_path: Path) -> List[Path]:
-    """Режет файл на куски по 20 минут"""
+    """Режет файл на куски по 5 минут"""
     audio = AudioSegment.from_file(audio_path)
     chunks = []
     for i, chunk in enumerate(audio[::CHUNK_LENGTH_MS]):
@@ -69,6 +67,7 @@ def slice_audio(audio_path: Path) -> List[Path]:
 # ---------- Работа с OpenAI ----------
 
 def transcribe_chunk(api_key: str, chunk_path: Path) -> dict:
+    """Транскрибация с защитой от таймаута"""
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {api_key}"}
     data = {
@@ -77,13 +76,23 @@ def transcribe_chunk(api_key: str, chunk_path: Path) -> dict:
         "chunking_strategy": json.dumps({"type": "server_vad"})
     }
     
-    with chunk_path.open("rb") as f:
-        files = {"file": (chunk_path.name, f, "audio/mpeg")}
-        r = requests.post(url, headers=headers, files=files, data=data, timeout=900)
-    
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI Error {r.status_code}: {r.text}")
-    return r.json()
+    # Пытаемся отправить файл до 3 раз в случае сбоя сети
+    for attempt in range(3):
+        try:
+            with chunk_path.open("rb") as f:
+                files = {"file": (chunk_path.name, f, "audio/mpeg")}
+                r = requests.post(url, headers=headers, files=files, data=data, timeout=900)
+            
+            if r.status_code == 200:
+                return r.json()
+            else:
+                print(f"  (!) Попытка {attempt+1} неудачна: {r.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"  (!) Ошибка сети на попытке {attempt+1}: {e}")
+        
+        time.sleep(10) # Пауза перед повтором
+        
+    raise RuntimeError(f"Не удалось отправить файл {chunk_path.name} после 3 попыток.")
 
 def analyze_speech_contextual(api_key: str, full_transcript_path: Path, me_id: str) -> str:
     """Контекстный анализ вашей речи"""
@@ -129,6 +138,9 @@ def main():
     sess_root = Path(config["paths"]["sessions_dir"])
     api_key = config["whisper_api"]["api_key"]
     ffmpeg = Path(config["paths"]["ffmpeg_path"])
+    
+    # Настройка pydub для работы с локальным ffmpeg
+    AudioSegment.converter = str(ffmpeg)
 
     seen_files = set()
 
@@ -142,12 +154,12 @@ def main():
                 
                 try:
                     full_mp3 = extract_audio(ffmpeg, file, s_dir / "full_audio")
-                    chunks = slice_audio(full_mp3) #
+                    chunks = slice_audio(full_mp3)
                     
                     all_segments = []
                     offset = 0.0
                     for i, c_path in enumerate(chunks):
-                        print(f"    Часть {i+1}...")
+                        print(f"    Часть {i+1} из {len(chunks)}...")
                         res = transcribe_chunk(api_key, c_path)
                         for seg in res.get("segments", []):
                             seg["start"] += offset
@@ -157,7 +169,7 @@ def main():
                         offset += (len(AudioSegment.from_file(c_path)) / 1000.0)
                         c_path.unlink()
 
-                    # Определение вас по длительности речи
+                    # Определение пользователя по длительности речи
                     stats = {}
                     for s in all_segments:
                         gid = s["global_id"]
@@ -173,13 +185,13 @@ def main():
                     t_file = s_dir / "transcript_full.txt"
                     t_file.write_text("\n".join(final_lines), encoding="utf-8")
                     
-                    report = analyze_speech_contextual(api_key, t_file, me_id) #
+                    report = analyze_speech_contextual(api_key, t_file, me_id)
                     (s_dir / "ai_analysis_report.txt").write_text(report, encoding="utf-8")
                     
-                    print(f"\n✅ Готово! Уровень: {report.split('Level')[-1][:10]}")
+                    print(f"\n✅ Готово! Результаты в папке: {s_dir.name}")
                     seen_files.add(file)
                 except Exception as e:
-                    print(f"Ошибка: {e}")
+                    print(f"Ошибка при обработке {file.name}: {e}")
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
