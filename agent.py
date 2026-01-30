@@ -8,7 +8,7 @@ from typing import List, Dict, Tuple, Any
 
 import yaml
 import requests
-
+import httpx
 
 CHECK_INTERVAL_SECONDS = 2
 STABLE_SECONDS_DEFAULT = 10
