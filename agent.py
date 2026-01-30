@@ -16,7 +16,7 @@ STABLE_POLL_INTERVAL = 1
 
 PRIMARY_CONFIDENCE_MIN_SHARE = 0.15
 MAX_TRANSCRIPT_CHARS_FOR_ANALYSIS = 14000
-TELEGRAM_MAX_MESSAGE_LEN = 3900  # безопаснее 4096
+TELEGRAM_MAX_MESSAGE_LEN = 3900  # safer than 4096
 
 
 # ---------- helpers ----------
@@ -161,13 +161,9 @@ def clip_text(s: str, max_chars: int) -> str:
     return "…(clipped)…\n" + s[-max_chars:]
 
 
-# ---------- NEW: chunking helpers (faster + more stable diarization on long sessions) ----------
+# ---------- chunking helpers ----------
 
 def split_wav(ffmpeg: Path, wav_path: Path, out_dir: Path, minutes: int = 15) -> List[Path]:
-    """
-    Splits wav into N chunks using ffmpeg segment muxer.
-    Returns list of chunk wav paths sorted by name.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pattern = out_dir / "chunk_%03d.wav"
     seg_seconds = minutes * 60
@@ -191,10 +187,6 @@ def split_wav(ffmpeg: Path, wav_path: Path, out_dir: Path, minutes: int = 15) ->
 
 
 def merge_diarized_chunks(chunk_results: List[Dict[str, Any]], chunk_seconds: int) -> Dict[str, Any]:
-    """
-    Merges diarized_json segments from multiple chunks into a single diarized dict,
-    shifting start/end timestamps by chunk offset.
-    """
     merged: Dict[str, Any] = {"segments": []}
     for idx, d in enumerate(chunk_results):
         offset = idx * chunk_seconds
@@ -221,11 +213,24 @@ def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     headers = {"Authorization": f"Bearer {api_key}"}
 
     def _post(form_data: dict) -> requests.Response:
+        t_req = time.time()
+        size_mb = wav_path.stat().st_size / 1024 / 1024
+        print(f"[TRANSCRIBE] -> POST {wav_path.name} ({size_mb:.1f} MB)")
+
         with wav_path.open("rb") as fh:
             files = {"file": (wav_path.name, fh, "audio/wav")}
-            return requests.post(url, headers=headers, files=files, data=form_data, timeout=3600)
+            resp = requests.post(
+                url,
+                headers=headers,
+                files=files,
+                data=form_data,
+                timeout=(30, 3600),  # 30s connect, up to 1 hour read
+            )
 
-    # 1) основной вариант
+        print(f"[TRANSCRIBE] <- status={resp.status_code} in {time.time()-t_req:.1f}s")
+        return resp
+
+    # 1) main variant
     form1 = {
         "model": "gpt-4o-transcribe-diarize",
         "response_format": "diarized_json",
@@ -235,7 +240,7 @@ def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     if r.status_code == 200:
         return r.json()
 
-    # 2) fallback на случай если API не принимает строку и требует объект
+    # 2) fallback if API expects object-style chunking_strategy
     body = r.text or ""
     if r.status_code == 400 and "chunking_strategy" in body:
         form2 = {
@@ -585,7 +590,7 @@ def main():
                 print(f"[AUDIO] extracting -> {wav_path}")
                 extract_audio(ffmpeg, input_copy, wav_path)
 
-                # --- CHANGED: diarization is now chunked ---
+                # chunked diarization
                 print("[TRANSCRIBE] diarized transcription via API (chunked)...")
                 chunk_minutes = 15
                 chunk_dir = session_dir / "chunks"
@@ -597,7 +602,6 @@ def main():
                     chunk_results.append(openai_transcribe_diarized(api_key, ch))
 
                 diarized = merge_diarized_chunks(chunk_results, chunk_seconds=chunk_minutes * 60)
-                # --- end changed ---
 
                 diar_json_path.write_text(json.dumps(diarized, ensure_ascii=False, indent=2), encoding="utf-8")
                 diar_txt_path.write_text(diarized_json_to_text(diarized), encoding="utf-8")
