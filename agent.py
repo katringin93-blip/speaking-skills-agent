@@ -165,16 +165,38 @@ def clip_text(s: str, max_chars: int) -> str:
 def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {api_key}"}
-    files = {"file": (wav_path.name, wav_path.open("rb"), "audio/wav")}
-    data = {
+
+    def _post(form_data: dict) -> requests.Response:
+        # важно: файл должен закрываться корректно
+        with wav_path.open("rb") as fh:
+            files = {"file": (wav_path.name, fh, "audio/wav")}
+            return requests.post(url, headers=headers, files=files, data=form_data, timeout=3600)
+
+    # 1) основной вариант
+    form1 = {
         "model": "gpt-4o-transcribe-diarize",
         "response_format": "diarized_json",
         "chunking_strategy": "auto",
     }
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=600)
-    if r.status_code != 200:
-        raise RuntimeError(f"Transcription error {r.status_code}: {r.text}")
-    return r.json()
+    r = _post(form1)
+    if r.status_code == 200:
+        return r.json()
+
+    # 2) fallback на случай если API не принимает строку и требует объект
+    body = r.text or ""
+    if r.status_code == 400 and "chunking_strategy" in body:
+        form2 = {
+            "model": "gpt-4o-transcribe-diarize",
+            "response_format": "diarized_json",
+            "chunking_strategy": json.dumps({"type": "auto"}, ensure_ascii=False),
+        }
+        r2 = _post(form2)
+        if r2.status_code == 200:
+            return r2.json()
+        raise RuntimeError(f"Transcription error {r2.status_code}: {r2.text}")
+
+    raise RuntimeError(f"Transcription error {r.status_code}: {r.text}")
+
 
 
 def _seg_speaker(seg: dict) -> str:
