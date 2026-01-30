@@ -135,17 +135,22 @@ def make_session_dir(root: Path) -> Path:
     return d
 
 
-def extract_audio(ffmpeg: Path, input_video: Path, output_wav: Path):
+def extract_audio(ffmpeg: Path, input_video: Path, output_audio: Path):
+    """Извлекает звук в MP3 для экономии места и обхода лимитов API"""
+    output_path = output_audio.with_suffix('.mp3')
     cmd = [
         str(ffmpeg), "-y",
         "-i", str(input_video),
+        "-vn",
         "-ac", "1",
         "-ar", "16000",
-        str(output_wav)
+        "-b:a", "64k",  # Сжатие до 64kbps (идеально для голоса)
+        str(output_path)
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg failed:\n{r.stderr}")
+    return output_path
 
 
 def read_text_safe(p: Path) -> str:
@@ -161,97 +166,38 @@ def clip_text(s: str, max_chars: int) -> str:
     return "…(clipped)…\n" + s[-max_chars:]
 
 
-# ---------- chunking helpers ----------
-
-def split_wav(ffmpeg: Path, wav_path: Path, out_dir: Path, minutes: int = 15) -> List[Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_pattern = out_dir / "chunk_%03d.wav"
-    seg_seconds = minutes * 60
-
-    cmd = [
-        str(ffmpeg), "-y",
-        "-i", str(wav_path),
-        "-f", "segment",
-        "-segment_time", str(seg_seconds),
-        "-c", "copy",
-        str(out_pattern),
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg split failed:\n{r.stderr}")
-
-    chunks = sorted(out_dir.glob("chunk_*.wav"))
-    if not chunks:
-        raise RuntimeError("ffmpeg split produced no chunks")
-    return chunks
-
-
-def merge_diarized_chunks(chunk_results: List[Dict[str, Any]], chunk_seconds: int) -> Dict[str, Any]:
-    merged: Dict[str, Any] = {"segments": []}
-    for idx, d in enumerate(chunk_results):
-        offset = idx * chunk_seconds
-        for s in (d.get("segments") or []):
-            s2 = dict(s)
-            if "start" in s2:
-                try:
-                    s2["start"] = float(s2["start"]) + offset
-                except Exception:
-                    pass
-            if "end" in s2:
-                try:
-                    s2["end"] = float(s2["end"]) + offset
-                except Exception:
-                    pass
-            merged["segments"].append(s2)
-    return merged
-
-
 # ---------- OpenAI diarized transcription ----------
 
-def openai_transcribe_diarized(api_key: str, wav_path: Path) -> dict:
+def openai_transcribe_diarized(api_key: str, audio_path: Path) -> dict:
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {api_key}"}
 
-    def _post(form_data: dict) -> httpx.Response:
-        t_req = time.time()
-        size_mb = wav_path.stat().st_size / 1024 / 1024
-        print(f"[TRANSCRIBE] -> POST {wav_path.name} ({size_mb:.1f} MB)")
+    size_mb = audio_path.stat().st_size / 1024 / 1024
+    print(f"[TRANSCRIBE] -> POST {audio_path.name} ({size_mb:.1f} MB)")
 
-        with wav_path.open("rb") as fh:
-            files = {"file": (wav_path.name, fh, "audio/wav")}
-            # timeout: 30s connect, 1h read
-            timeout = httpx.Timeout(connect=30.0, read=3600.0, write=3600.0, pool=30.0)
-            with httpx.Client(timeout=timeout) as client:
-                r = client.post(url, headers=headers, files=files, data=form_data)
-
-        print(f"[TRANSCRIBE] <- status={r.status_code} in {time.time()-t_req:.1f}s")
-        return r
-
-    # 1) основной вариант
-    form1 = {
+    # Подготовка данных формы
+    # Модели с диаризацией требуют chunking_strategy в виде JSON-объекта
+    data = {
         "model": "gpt-4o-transcribe-diarize",
         "response_format": "diarized_json",
-        "chunking_strategy": "auto",
+        "chunking_strategy": json.dumps({"type": "auto"})
     }
-    r = _post(form1)
+
+    with audio_path.open("rb") as fh:
+        files = {"file": (audio_path.name, fh, "audio/mpeg")}
+        # Timeout 10 минут (600с) для загрузки и обработки
+        timeout = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
+        
+        with httpx.Client(timeout=timeout) as client:
+            t_req = time.time()
+            r = client.post(url, headers=headers, files=files, data=data)
+
+    print(f"[TRANSCRIBE] <- status={r.status_code} in {time.time()-t_req:.1f}s")
+    
     if r.status_code == 200:
         return r.json()
-
-    # 2) fallback: если API требует объект chunking_strategy
-    body = r.text or ""
-    if r.status_code == 400 and "chunking_strategy" in body:
-        form2 = {
-            "model": "gpt-4o-transcribe-diarize",
-            "response_format": "diarized_json",
-            "chunking_strategy": json.dumps({"type": "auto"}, ensure_ascii=False),
-        }
-        r2 = _post(form2)
-        if r2.status_code == 200:
-            return r2.json()
-        raise RuntimeError(f"Transcription error {r2.status_code}: {r2.text}")
-
-    raise RuntimeError(f"Transcription error {r.status_code}: {r.text}")
-
+    else:
+        raise RuntimeError(f"Transcription error {r.status_code}: {r.text}")
 
 
 def _seg_speaker(seg: dict) -> str:
@@ -560,7 +506,7 @@ def main():
     while True:
         if obs_dir.exists():
             for f in obs_dir.iterdir():
-                if f.suffix.lower() != ".mkv" or f in seen:
+                if f.suffix.lower() not in (".mkv", ".mp4") or f in seen:
                     continue
 
                 print(f"\n[FOUND] {f.name} -> waiting to stabilize...")
@@ -570,8 +516,7 @@ def main():
                     continue
 
                 session_dir = make_session_dir(sessions_root)
-                input_copy = session_dir / "input.mkv"
-                wav_path = session_dir / "audio.wav"
+                input_copy = session_dir / f"input{f.suffix}"
 
                 diar_json_path = session_dir / "transcript_diarized.json"
                 diar_txt_path = session_dir / "transcript_diarized.txt"
@@ -585,25 +530,19 @@ def main():
                 print(f"[COPY] -> {input_copy}")
                 shutil.copy2(f, input_copy)
 
-                print(f"[AUDIO] extracting -> {wav_path}")
-                extract_audio(ffmpeg, input_copy, wav_path)
+                # 1. Извлекаем звук в MP3 (намного легче для API)
+                print(f"[AUDIO] extracting MP3...")
+                mp3_path = extract_audio(ffmpeg, input_copy, session_dir / "audio")
 
-                # chunked diarization
-                print("[TRANSCRIBE] diarized transcription via API (chunked)...")
-                chunk_minutes = 15
-                chunk_dir = session_dir / "chunks"
-                chunks = split_wav(ffmpeg, wav_path, chunk_dir, minutes=chunk_minutes)
+                # 2. Транскрибируем ОДНИМ файлом (без чанкинга)
+                print("[TRANSCRIBE] diarized transcription via API...")
+                diarized = openai_transcribe_diarized(api_key, mp3_path)
 
-                chunk_results: List[Dict[str, Any]] = []
-                for i, ch in enumerate(chunks, 1):
-                    print(f"[TRANSCRIBE] chunk {i}/{len(chunks)}: {ch.name}")
-                    chunk_results.append(openai_transcribe_diarized(api_key, ch))
-
-                diarized = merge_diarized_chunks(chunk_results, chunk_seconds=chunk_minutes * 60)
-
+                # Сохраняем результаты
                 diar_json_path.write_text(json.dumps(diarized, ensure_ascii=False, indent=2), encoding="utf-8")
                 diar_txt_path.write_text(diarized_json_to_text(diarized), encoding="utf-8")
 
+                # Статистика и выбор основного спикера
                 stats = compute_speaker_stats(diarized)
                 choice = choose_primary_speaker(stats)
                 stats_out = {"primary_selection": choice, "stats": stats}
@@ -613,6 +552,7 @@ def main():
                 write_primary_and_context(diarized, primary_label, primary_txt, context_txt)
                 print(f"[PRIMARY] {primary_label} (confidence: {choice.get('confidence')}, diff_share: {choice.get('diff_share')})")
 
+                # 3. Анализ текста
                 analysis = None
                 if analysis_enabled:
                     print("[ANALYSIS] generating session report via Responses API...")
@@ -622,8 +562,9 @@ def main():
                     analysis = openai_responses_analyze(api_key, analysis_model, diarized_text, primary_text)
                     analysis_json_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
                     analysis_md_path.write_text(analysis_json_to_md(analysis), encoding="utf-8")
-                    print(f"[ANALYSIS] saved -> {analysis_md_path.name}, {analysis_json_path.name}")
+                    print(f"[ANALYSIS] saved -> {analysis_md_path.name}")
 
+                # 4. Telegram
                 if tg_enabled:
                     if not tg_token or not tg_chat_id:
                         print("[TELEGRAM] enabled but token/chat_id missing -> skip")
@@ -636,8 +577,6 @@ def main():
                             telegram_send_document(tg_token, tg_chat_id, analysis_md_path, caption="analysis.md")
                         if tg_send_json and analysis_json_path.exists():
                             telegram_send_document(tg_token, tg_chat_id, analysis_json_path, caption="analysis.json")
-
-                        print("[TELEGRAM] sent")
 
                 print(f"[DONE] session saved -> {session_dir}")
                 seen.add(f)
