@@ -3,7 +3,7 @@ import time
 import subprocess
 import os
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 import yaml
 import requests
@@ -12,7 +12,7 @@ from pydub import AudioSegment
 # ---------- Константы ----------
 CHECK_INTERVAL_SECONDS = 2
 CHUNK_LENGTH_MS = 300 * 1000  # 5 минут
-TELEGRAM_SAFE_LIMIT = 3500  # короткий вариант для Telegram (запас к лимиту ~4096)
+TELEGRAM_SAFE_LIMIT = 3500  # запас к лимиту Telegram ~4096
 
 # ---------- Логирование ----------
 
@@ -155,128 +155,105 @@ def transcribe_chunk(api_key: str, chunk_path: Path) -> str:
 
 def analyze_full(api_key: str, transcript: str) -> str:
     prompt = f"""
-You are an IELTS Speaking examiner.
-You will be given a transcript and/or audio-based description of one speaker only.
-There is no dialogue context.
-Evaluate the speaker strictly according to IELTS Speaking Band Descriptors.
+You are an English speaking teacher and IELTS-style evaluator.
+You are given the speech of one speaker only (no dialogue context).
+Your task is to assess the speaking performance and give actionable learning feedback.
 
-Important rules:
-
-Assess only what is present in the speaker’s speech.
-
-Do not assume missing abilities.
-
-Use the official 0–9 IELTS band scale (allow .5 scores).
+Rules:
 
 Respond only in English.
 
-Be concise, precise, and analytical.
+Use the IELTS 0–9 band scale (.5 allowed).
 
-Evaluation Criteria (all are mandatory)
-1. Fluency and Coherence
+Be concise and Telegram-friendly.
 
-Assign a band score (0–9 or .5).
+Focus on practical improvement, not theory.
 
-Briefly explain the score.
+Show examples of mistakes AND better versions.
 
-Provide specific examples of issues or strengths, such as:
+For EACH criterion, provide:
 
-long or frequent pauses
+Band score
 
-hesitation due to word search
+Main issue to work on (1 line, learning-focused)
 
-repetition or self-correction
+Example from the speech (typical error or weakness)
 
-weak or effective logical progression
+Improved version (how it could sound better)
 
-overuse or lack of linking devices
+Criteria (mandatory)
 
-2. Lexical Resource
+Fluency and Coherence
+Focus on:
 
-Assign a band score (0–9 or .5).
+unnecessary pauses or fillers
 
-Briefly explain the score.
+speaking too cautiously or too fast
 
-Provide examples from the speech, including:
+weak logical flow in longer answers
 
-limited vocabulary or excessive repetition
+Lexical Resource
+Focus on:
 
-incorrect word choice or collocation errors
+repetitive or “safe” vocabulary
 
-successful or failed paraphrasing
+vague wording
 
-inappropriate use of idiomatic language
+incorrect or unnatural collocations
 
-precision vs vagueness
+Grammatical Range and Accuracy
+Focus on:
 
-3. Grammatical Range and Accuracy
+overuse of simple sentence patterns
 
-Assign a band score (0–9 or .5).
+frequent small errors (tenses, articles, word order)
 
-Briefly explain the score.
+missed chances to use more complex structures
 
-Give concrete examples, such as:
+Pronunciation
+Focus on:
 
-frequent basic sentence structures only
+sounds or stress that reduce clarity
 
-errors in tense, agreement, word order, articles, prepositions
+flat or unnatural intonation
 
-attempts at complex structures (relative clauses, conditionals, subordination)
+clarity at normal speaking speed
 
-whether errors are systematic or occasional
+Final section (mandatory)
 
-4. Pronunciation
+Overall Speaking Band: X.X
+Main focus for next sessions (1–2 points):
 
-Assign a band score (0–9 or .5).
+…
 
-Briefly explain the score.
+…
 
-Provide examples or observations, including:
+Output format (strict, compact)
 
-mispronounced sounds that affect understanding
+Fluency & Coherence — Band X.X
+Main issue: …
+Example: “… ”
+Better: “… ”
 
-word stress errors
+Lexical Resource — Band X.X
+Main issue: …
+Example: “… ”
+Better: “… ”
 
-sentence stress and intonation issues
+Grammar — Band X.X
+Main issue: …
+Example: “… ”
+Better: “… ”
 
-rhythm and connected speech
+Pronunciation — Band X.X
+Main issue: …
+Example: …
+Better target: …
 
-degree to which accent interferes with intelligibility
+Overall Band: X.X
+Next focus: …
 
-Final Results
-
-Overall IELTS Speaking Band Score
-
-Calculate the average of the four criteria.
-
-Round to the nearest 0.5 as per IELTS rules.
-
-Estimated CEFR Level
-
-Map the final band score to CEFR (B1 / B2 / C1 / C2).
-
-Output Format (strict)
-
-Fluency and Coherence: Band X.X
-Explanation: …
-Error / example notes: …
-
-Lexical Resource: Band X.X
-Explanation: …
-Error / example notes: …
-
-Grammatical Range and Accuracy: Band X.X
-Explanation: …
-Error / example notes: …
-
-Pronunciation: Band X.X
-Explanation: …
-Error / example notes: …
-
-Overall IELTS Speaking Band: X.X
-Estimated CEFR Level: …
-
-TRANSCRIPT:
+Transcript:
 {transcript}
 """
     r = requests.post(
@@ -295,33 +272,70 @@ TRANSCRIPT:
 
 def analyze_short(api_key: str, transcript: str, full_report: str) -> str:
     prompt = f"""
-You are an IELTS Speaking examiner.
+You are an English speaking teacher and IELTS-style evaluator.
+You are given the speech of one speaker only (no dialogue context).
+Your task is to assess the speaking performance and give actionable learning feedback.
+
+Rules:
+
 Respond only in English.
-Keep the full response under 3000 characters.
 
-You MUST be consistent with the FULL REPORT below:
-- Use the same band scores for each criterion and the same overall band and CEFR.
-- Keep explanations short, but do not contradict the full report.
+Use the IELTS 0–9 band scale (.5 allowed).
 
-Output strictly in this format:
+Be concise and Telegram-friendly.
 
-🎯 IELTS Speaking — Short Report
+Focus on practical improvement, not theory.
 
-🗣 Fluency & Coherence: Band X.X — one-sentence rationale
-📚 Lexical Resource: Band X.X — one-sentence rationale
-🧠 Grammar: Band X.X — one-sentence rationale
-🔊 Pronunciation: Band X.X — one-sentence rationale
+Show examples of mistakes AND better versions.
 
-⭐ Overall Band: X.X
-📈 CEFR: B1 / B2 / C1 / C2
-🧩 Top 2 priorities (next session):
-1) ...
-2) ...
+TELEGRAM CONSTRAINTS (mandatory):
+- The entire response MUST be under 2800 characters.
+- Keep each "Example" short (<= 12 words) and each "Better" short (<= 18 words).
+- Prefer one strong example per criterion.
+
+CONSISTENCY CONSTRAINT (mandatory):
+- Your band scores, overall band, and "Next focus" MUST be consistent with the FULL REPORT below.
+- Do not contradict the FULL REPORT.
+
+For EACH criterion, provide:
+
+Band score
+
+Main issue to work on (1 line, learning-focused)
+
+Example from the speech (typical error or weakness)
+
+Improved version (how it could sound better)
+
+Output format (strict, compact)
+
+Fluency & Coherence — Band X.X
+Main issue: …
+Example: “… ”
+Better: “… ”
+
+Lexical Resource — Band X.X
+Main issue: …
+Example: “… ”
+Better: “… ”
+
+Grammar — Band X.X
+Main issue: …
+Example: “… ”
+Better: “… ”
+
+Pronunciation — Band X.X
+Main issue: …
+Example: …
+Better target: …
+
+Overall Band: X.X
+Next focus: …
 
 FULL REPORT:
 {full_report}
 
-TRANSCRIPT (for reference):
+Transcript (for reference):
 {transcript}
 """
     r = requests.post(
