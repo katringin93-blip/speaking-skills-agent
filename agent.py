@@ -157,23 +157,135 @@ def analyze_speech_contextual(api_key: str, full_transcript_path: Path, me_id: s
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     prompt = f"""
-Analyze the English of the speaker from the transcript below (ONLY 'me', no other participants).
+You are an IELTS Speaking examiner.
+You will be given a transcript and/or audio-based description of one speaker only.
+There is no dialogue context.
+Evaluate the speaker strictly according to IELTS Speaking Band Descriptors.
+
+Important rules:
+
+Assess only what is present in the speaker’s speech.
+
+Do not assume missing abilities.
+
+Use the official 0–9 IELTS band scale (allow .5 scores).
+
+Respond only in English.
+
+Be concise, precise, and analytical.
+
+Evaluation Criteria (all are mandatory)
+1. Fluency and Coherence
+
+Assign a band score (0–9 or .5).
+
+Briefly explain the score.
+
+Provide specific examples of issues or strengths, such as:
+
+long or frequent pauses
+
+hesitation due to word search
+
+repetition or self-correction
+
+weak or effective logical progression
+
+overuse or lack of linking devices
+
+2. Lexical Resource
+
+Assign a band score (0–9 or .5).
+
+Briefly explain the score.
+
+Provide examples from the speech, including:
+
+limited vocabulary or excessive repetition
+
+incorrect word choice or collocation errors
+
+successful or failed paraphrasing
+
+inappropriate use of idiomatic language
+
+precision vs vagueness
+
+3. Grammatical Range and Accuracy
+
+Assign a band score (0–9 or .5).
+
+Briefly explain the score.
+
+Give concrete examples, such as:
+
+frequent basic sentence structures only
+
+errors in tense, agreement, word order, articles, prepositions
+
+attempts at complex structures (relative clauses, conditionals, subordination)
+
+whether errors are systematic or occasional
+
+4. Pronunciation
+
+Assign a band score (0–9 or .5).
+
+Briefly explain the score.
+
+Provide examples or observations, including:
+
+mispronounced sounds that affect understanding
+
+word stress errors
+
+sentence stress and intonation issues
+
+rhythm and connected speech
+
+degree to which accent interferes with intelligibility
+
+Final Results
+
+Overall IELTS Speaking Band Score
+
+Calculate the average of the four criteria.
+
+Round to the nearest 0.5 as per IELTS rules.
+
+Estimated CEFR Level
+
+Map the final band score to CEFR (B1 / B2 / C1 / C2).
+
+Output Format (strict)
+
+Fluency and Coherence: Band X.X
+Explanation: …
+Error / example notes: …
+
+Lexical Resource: Band X.X
+Explanation: …
+Error / example notes: …
+
+Grammatical Range and Accuracy: Band X.X
+Explanation: …
+Error / example notes: …
+
+Pronunciation: Band X.X
+Explanation: …
+Error / example notes: …
+
+Overall IELTS Speaking Band: X.X
+Estimated CEFR Level: …
+
 TRANSCRIPT:
 {clipped_text}
-
-REPORT (In Russian):
-1. Fluency & Coherence
-2. Grammatical Range & Accuracy
-3. Lexical Resource
-4. Pronunciation & Delivery (infer from text where possible; mention limits)
-
-SCORE: estimate CEFR level and give prioritized advice.
 """
 
     payload = {
         "model": "gpt-4o",
         "messages": [
-            {"role": "system", "content": "You are an English Examiner. Answer in Russian."},
+            {"role": "system", "content": "You are an IELTS Speaking examiner. Respond only in English."},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.3
