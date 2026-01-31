@@ -1,11 +1,9 @@
 import sys
 import time
-import shutil
 import subprocess
-import json
 import os
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
 import yaml
 import requests
@@ -13,7 +11,7 @@ from pydub import AudioSegment
 
 # ---------- Константы ----------
 CHECK_INTERVAL_SECONDS = 2
-CHUNK_LENGTH_MS = 300 * 1000  # 5 минут (стабильно для API)
+CHUNK_LENGTH_MS = 300 * 1000  # 5 минут
 
 # ---------- Помощники ----------
 
@@ -66,11 +64,6 @@ def _run_ffmpeg(cmd: List[str]) -> None:
         raise RuntimeError(f"ffmpeg error (code {r.returncode}): {msg}")
 
 def extract_me_and_others(ffmpeg: Path, input_video: Path, out_dir: Path) -> Tuple[Path, Path]:
-    """
-    Извлекает:
-      - me.wav     из 0:a:1
-      - others.wav из 0:a:0
-    """
     me_wav = out_dir / "me.wav"
     others_wav = out_dir / "others.wav"
 
@@ -88,9 +81,6 @@ def extract_me_and_others(ffmpeg: Path, input_video: Path, out_dir: Path) -> Tup
     return me_wav, others_wav
 
 def clean_me_audio(ffmpeg: Path, me_wav: Path, out_dir: Path) -> Path:
-    """
-    ffmpeg -i me.wav -af "highpass=f=120, lowpass=f=6000, afftdn" me_clean.wav
-    """
     me_clean = out_dir / "me_clean.wav"
     cmd = [
         str(ffmpeg), "-y",
@@ -106,9 +96,6 @@ def clean_me_audio(ffmpeg: Path, me_wav: Path, out_dir: Path) -> Path:
     return me_clean
 
 def normalize_for_api(ffmpeg: Path, input_wav: Path, out_dir: Path) -> Path:
-    """
-    Приводит к моно 16k, чтобы транскрибация была стабильнее.
-    """
     out = out_dir / "me_clean_16k.wav"
     cmd = [
         str(ffmpeg), "-y",
@@ -120,7 +107,6 @@ def normalize_for_api(ffmpeg: Path, input_wav: Path, out_dir: Path) -> Path:
     return out
 
 def slice_audio(audio_path: Path) -> List[Path]:
-    """Режет файл на куски по 5 минут (MP3)"""
     audio = AudioSegment.from_file(audio_path)
     chunks: List[Path] = []
     for i, chunk in enumerate(audio[::CHUNK_LENGTH_MS]):
@@ -131,14 +117,17 @@ def slice_audio(audio_path: Path) -> List[Path]:
 
 # ---------- Работа с OpenAI ----------
 
-def transcribe_chunk(api_key: str, chunk_path: Path) -> dict:
+def transcribe_chunk(api_key: str, chunk_path: Path) -> str:
     """
     Транскрибация (без диаризации).
-    Возвращает verbose_json, чтобы были сегменты с таймкодами.
+    Используется response_format, совместимый с текущим transcribe-моделями.
     """
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {api_key}"}
-    data = {"model": "gpt-4o-transcribe", "response_format": "verbose_json"}
+    data = {
+        "model": "gpt-4o-transcribe",
+        "response_format": "text"
+    }
 
     for attempt in range(3):
         try:
@@ -147,7 +136,7 @@ def transcribe_chunk(api_key: str, chunk_path: Path) -> dict:
                 r = requests.post(url, headers=headers, files=files, data=data, timeout=900)
 
             if r.status_code == 200:
-                return r.json()
+                return (r.text or "").strip()
 
             print(f"  (!) Попытка {attempt+1} неудачна: {r.status_code} {r.text[:300]}")
         except requests.exceptions.RequestException as e:
@@ -158,7 +147,6 @@ def transcribe_chunk(api_key: str, chunk_path: Path) -> dict:
     raise RuntimeError(f"Не удалось отправить файл {chunk_path.name} после 3 попыток.")
 
 def analyze_speech_contextual(api_key: str, full_transcript_path: Path, me_id: str) -> str:
-    """Контекстный анализ вашей речи (только 'me')"""
     full_text = full_transcript_path.read_text(encoding="utf-8")
     clipped_text = full_text[-25000:] if len(full_text) > 25000 else full_text
 
@@ -169,27 +157,32 @@ def analyze_speech_contextual(api_key: str, full_transcript_path: Path, me_id: s
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     prompt = f"""
-    Analyze the speech of the PRIMARY SPEAKER (marked as 'YOU') in English.
-    TRANSCRIPT: {clipped_text}
-    REPORT (In Russian):
-    1. Fluency & Coherence
-    2. Grammatical Range & Accuracy
-    3. Lexical Resource
-    4. Pronunciation & Dynamic (infer from text where possible; mention limits)
-    SCORE: CEFR Level and Advice.
-    """
+Analyze the English of the speaker from the transcript below (ONLY 'me', no other participants).
+TRANSCRIPT:
+{clipped_text}
+
+REPORT (In Russian):
+1. Fluency & Coherence
+2. Grammatical Range & Accuracy
+3. Lexical Resource
+4. Pronunciation & Delivery (infer from text where possible; mention limits)
+
+SCORE: estimate CEFR level and give prioritized advice.
+"""
 
     payload = {
         "model": "gpt-4o",
         "messages": [
-            {"role": "system", "content": "You are an English Examiner. Analyze ONLY the speaker marked as 'YOU'. Answer in Russian."},
+            {"role": "system", "content": "You are an English Examiner. Answer in Russian."},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.3
     }
 
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
-    return header + r.json()["choices"][0]["message"]["content"] if r.status_code == 200 else f"Error: {r.status_code}"
+    r = requests.post(url, headers=headers, json=payload, timeout=180)
+    if r.status_code == 200:
+        return header + r.json()["choices"][0]["message"]["content"]
+    return header + f"Error: {r.status_code}\n{r.text[:2000]}"
 
 # ---------- Основная логика ----------
 
@@ -219,7 +212,6 @@ def main():
                 continue
             if file in seen_files:
                 continue
-
             if not is_file_stable(file, stable_seconds=10, poll_interval=1):
                 continue
 
@@ -228,38 +220,18 @@ def main():
             s_dir.mkdir(parents=True, exist_ok=True)
 
             try:
-                # 1) Извлечение me.wav и others.wav (по новым требованиям)
-                me_wav, others_wav = extract_me_and_others(ffmpeg, file, s_dir)
-
-                # 2) Очистка me.wav -> me_clean.wav
+                me_wav, _others_wav = extract_me_and_others(ffmpeg, file, s_dir)
                 me_clean = clean_me_audio(ffmpeg, me_wav, s_dir)
-
-                # 3) Нормализация для API (моно 16k)
                 me_clean_16k = normalize_for_api(ffmpeg, me_clean, s_dir)
 
-                # 4) Чанкинг и транскрибация (без диаризации)
                 chunks = slice_audio(me_clean_16k)
 
-                all_lines = []
-                offset = 0.0
+                all_lines: List[str] = []
                 for i, c_path in enumerate(chunks):
                     print(f"    Часть {i+1} из {len(chunks)}...")
-                    res = transcribe_chunk(api_key, c_path)
-
-                    segments = res.get("segments", [])
-                    if segments:
-                        for seg in segments:
-                            start = float(seg.get("start", 0.0)) + offset
-                            end = float(seg.get("end", 0.0)) + offset
-                            text = (seg.get("text") or "").strip()
-                            if text:
-                                all_lines.append(f"[{start:.1f}-{end:.1f}] YOU: {text}")
-                    else:
-                        txt = (res.get("text") or "").strip()
-                        if txt:
-                            all_lines.append(f"[{offset:.1f}] YOU: {txt}")
-
-                    offset += (len(AudioSegment.from_file(c_path)) / 1000.0)
+                    text = transcribe_chunk(api_key, c_path)
+                    if text:
+                        all_lines.append(text)
 
                     try:
                         c_path.unlink()
@@ -267,7 +239,7 @@ def main():
                         pass
 
                 t_file = s_dir / "transcript_me.txt"
-                t_file.write_text("\n".join(all_lines), encoding="utf-8")
+                t_file.write_text("\n\n".join(all_lines).strip(), encoding="utf-8")
 
                 report = analyze_speech_contextual(api_key, t_file, me_id)
                 (s_dir / "ai_analysis_report.txt").write_text(report, encoding="utf-8")
