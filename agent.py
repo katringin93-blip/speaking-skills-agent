@@ -218,106 +218,131 @@ def transcribe_chunk(api_key: str, chunk_path: Path) -> str:
     return r.text.strip()
 
 def analyze_full(api_key: str, transcript: str) -> str:
+    # UPDATED PROMPT ONLY
     prompt = f"""
-You are an English speaking teacher and IELTS-style evaluator.
+You are an English speaking teacher and IELTS-style examiner.
 You are given the speech of one speaker only (no dialogue context).
-Your task is to assess the speaking performance and give actionable learning feedback.
+Your task is to evaluate the speaking performance and provide learning-focused feedback for improvement.
 
 Rules:
+- Respond only in English.
+- Use the IELTS 0–9 band scale (.5 allowed).
+- Be concise and Telegram-friendly.
+- No theory, no motivation, no generic advice.
+- All feedback must be example-based.
+- When selecting examples, focus on high-impact weaknesses, not the most frequent ones.
 
-Respond only in English.
+For EACH criterion, do the following:
+1) Assign a Band Score (precise IELTS band).
+2) Give THREE example-based observations.
+   Select three non-trivial, high-impact issues that would noticeably lower the speaking score, even if they occur rarely.
 
-Use the IELTS 0–9 band scale (.5 allowed).
+For each example include:
+- How the speaker sounded (typical phrasing or pattern)
+- Why this significantly reduces the speaking score (clarity, naturalness, control, or level ceiling)
+- A better version (how the same idea could sound more natural, precise, or advanced)
 
-Be concise and Telegram-friendly.
-
-Focus on practical improvement, not theory.
-
-Show examples of mistakes AND better versions.
-
-For EACH criterion, provide:
-
-Band score
-
-Main issue to work on (1 line, learning-focused)
-
-Example from the speech (typical error or weakness)
-
-Improved version (how it could sound better)
+Avoid:
+- basic learner mistakes
+- obvious or beginner-level errors
+- surface issues that do not affect the band
 
 Criteria (mandatory)
 
 Fluency and Coherence
 Focus on:
-
-unnecessary pauses or fillers
-
-speaking too cautiously or too fast
-
-weak logical flow in longer answers
+- breakdowns in extended turns
+- unnatural pacing caused by over-planning
+- loss of discourse control (topic drift, weak framing)
 
 Lexical Resource
 Focus on:
-
-repetitive or “safe” vocabulary
-
-vague wording
-
-incorrect or unnatural collocations
+- imprecise abstraction
+- weak collocational control
+- vocabulary choices that cap the level at mid-C1
 
 Grammatical Range and Accuracy
 Focus on:
-
-overuse of simple sentence patterns
-
-frequent small errors (tenses, articles, word order)
-
-missed chances to use more complex structures
+- syntactic simplicity that limits expressiveness
+- failed or avoided complex structures
+- errors that undermine perceived control
 
 Pronunciation
 Focus on:
-
-sounds or stress that reduce clarity
-
-flat or unnatural intonation
-
-clarity at normal speaking speed
+- prosodic issues affecting meaning
+- misplaced sentence stress
+- intonation that weakens stance or contrast
 
 Final section (mandatory)
 
 Overall Speaking Band: X.X
-Main focus for next sessions (1–2 points):
 
-…
+Vocabulary Micro-Exercises for the Next Session (max 5 min each):
 
-…
+Exercise 1 (≤5 min):
+A short, concrete vocabulary task directly targeting the most damaging issues above.
 
-Output format (strict, compact)
+Exercise 2 (≤5 min):
+A different short vocabulary task that prevents recurrence of those high-impact issues.
+
+Exercises must:
+- take no more than 5 minutes each
+- focus only on vocabulary expansion
+- be immediately usable in the next speaking session
+
+Output format (strict)
 
 Fluency & Coherence — Band X.X
-Main issue: …
-Example: “… ”
-Better: “… ”
+1) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
+2) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
+3) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
 
 Lexical Resource — Band X.X
-Main issue: …
-Example: “… ”
-Better: “… ”
+1) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
+2) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
+3) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
 
 Grammar — Band X.X
-Main issue: …
-Example: “… ”
-Better: “… ”
+1) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
+2) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
+3) Sounded like: "..."
+   Why it hurts: ...
+   Better: "..."
 
 Pronunciation — Band X.X
-Main issue: …
-Example: …
-Better target: …
+1) Sounded like: "..."
+   Why it hurts: ...
+   Better target: ...
+2) Sounded like: "..."
+   Why it hurts: ...
+   Better target: ...
+3) Sounded like: "..."
+   Why it hurts: ...
+   Better target: ...
 
-Overall Band: X.X
-Next focus: …
+Overall Speaking Band: X.X
 
-Transcript:
+Vocabulary Micro-Exercises:
+Exercise 1 (≤5 min): ...
+Exercise 2 (≤5 min): ...
+
+TRANSCRIPT:
 {transcript}
 """
     r = requests.post(
@@ -335,61 +360,68 @@ Transcript:
     return r.json()["choices"][0]["message"]["content"]
 
 def analyze_short(api_key: str, transcript: str, full_report: str) -> str:
+    # UPDATED PROMPT ONLY (Lexical: 3 examples; Grammar: 3 examples)
     prompt = f"""
-You are an English speaking teacher and IELTS-style evaluator.
-You are given the speech of one speaker only (no dialogue context).
-Your task is to assess the speaking performance and give actionable learning feedback.
+You are an English speaking teacher and IELTS-style examiner.
 
-Rules:
+You must produce a SHORT Telegram-ready report that is a condensed, fully consistent version of the FULL REPORT below.
 
-Respond only in English.
+Rules (mandatory):
+- Respond only in English.
+- Use the SAME band scores and overall band as in the FULL REPORT.
+- Emoji-structured and easy to scan.
+- No theory, no motivation, no generic advice.
+- Example-based only.
+- Do NOT invent new issues. Do NOT contradict the FULL REPORT.
+- TELEGRAM LENGTH: the entire response MUST be under 2800 characters.
 
-Use the IELTS 0–9 band scale (.5 allowed).
+Selection rules:
+- Pick only high-impact weaknesses (not the most frequent).
+- Keep examples short (<= 12 words) and improved versions short (<= 18 words).
 
-Be concise and Telegram-friendly.
+Special requirements:
+- Lexical Resource MUST include 3 incorrect/weak examples and 3 better versions.
+- Grammar MUST include 3 incorrect/weak examples and 3 better versions.
+- Fluency and Pronunciation: 1 example + 1 better version.
 
-Focus on practical improvement, not theory.
+Format strictly as follows:
 
-Show examples of mistakes AND better versions.
+🎯 IELTS Speaking — Session Summary
 
-TELEGRAM CONSTRAINTS (mandatory):
-- The entire response MUST be under 2800 characters.
-- Keep each "Example" short (<= 12 words) and each "Better" short (<= 18 words).
-- Prefer one strong example per criterion.
+🗣 Fluency & Coherence — Band X.X
+Issue: …
+Example: “…”
+Better: “…”
 
-CONSISTENCY CONSTRAINT (mandatory):
-- Your band scores, overall band, and "Next focus" MUST be consistent with the FULL REPORT below.
-- Do not contradict the FULL REPORT.
+📚 Lexical Resource — Band X.X
+Issue: …
+Examples:
+1) “…” → “…”
+2) “…” → “…”
+3) “…” → “…”
 
-Output format (strict, compact)
+🧠 Grammar — Band X.X
+Issue: …
+Examples:
+1) “…” → “…”
+2) “…” → “…”
+3) “…” → “…”
 
-Fluency & Coherence — Band X.X
-Main issue: …
-Example: “… ”
-Better: “… ”
-
-Lexical Resource — Band X.X
-Main issue: …
-Example: “… ”
-Better: “… ”
-
-Grammar — Band X.X
-Main issue: …
-Example: “… ”
-Better: “… ”
-
-Pronunciation — Band X.X
-Main issue: …
+🔊 Pronunciation — Band X.X
+Issue: …
 Example: …
-Better target: …
+Better: …
 
-Overall Band: X.X
-Next focus: …
+⭐ Overall Band: X.X
+
+🧩 Vocabulary Focus for Next Session:
+• …
+• …
 
 FULL REPORT:
 {full_report}
 
-Transcript (for reference):
+TRANSCRIPT (reference only):
 {transcript}
 """
     r = requests.post(
@@ -487,7 +519,7 @@ def main():
                 full_path.write_text(full_report, encoding="utf-8")
                 log(f"Full analysis saved: {full_path.name} ({len(full_report)} chars)")
 
-                # ---- Добавлено: сохранение в Obsidian ----
+                # ---- сохранение в Obsidian ----
                 if obsidian_sessions_dir:
                     try:
                         log("Saving transcript + full analysis to Obsidian (Markdown)")
@@ -504,7 +536,7 @@ def main():
                         log(f"ERROR: Obsidian save failed: {e}")
                 else:
                     log("Obsidian sessions dir not set; skipping Obsidian save")
-                # ----------------------------------------
+                # -------------------------------
 
                 log("Step 7/7: generating SHORT analysis (Telegram)")
                 short_report = analyze_short(api_key, transcript, full_report)
