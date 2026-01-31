@@ -67,6 +67,70 @@ def _run_ffmpeg(cmd: List[str]) -> None:
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout or "").strip())
 
+def _yaml_frontmatter(meta: Dict[str, Any]) -> str:
+    def _dump(v):
+        if v is None:
+            return "null"
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return str(v)
+        s = str(v).replace('"', '\\"')
+        return f"\"{s}\""
+    lines = ["---"]
+    for k, v in meta.items():
+        lines.append(f"{k}: {_dump(v)}")
+    lines.append("---\n")
+    return "\n".join(lines)
+
+def save_to_obsidian(
+    obsidian_sessions_dir: Path,
+    session_folder_name: str,
+    session_dt: str,
+    source_recording: str,
+    transcript: str,
+    full_report: str,
+):
+    """
+    Создаёт папку сессии в Obsidian и сохраняет 2 Markdown-файла:
+      - transcript.md
+      - analysis.md (расширенный)
+    """
+    target_dir = obsidian_sessions_dir / session_folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    transcript_md = target_dir / "transcript.md"
+    analysis_md = target_dir / "analysis.md"
+
+    transcript_meta = {
+        "type": "speaking_session_transcript",
+        "date": session_dt,
+        "source_recording": source_recording,
+        "session_folder": session_folder_name,
+    }
+    analysis_meta = {
+        "type": "speaking_session_analysis_full",
+        "date": session_dt,
+        "source_recording": source_recording,
+        "session_folder": session_folder_name,
+    }
+
+    transcript_content = (
+        _yaml_frontmatter(transcript_meta)
+        + "# Transcript\n\n"
+        + (transcript.strip() if transcript else "")
+        + "\n"
+    )
+    analysis_content = (
+        _yaml_frontmatter(analysis_meta)
+        + "# Analysis (Full)\n\n"
+        + (full_report.strip() if full_report else "")
+        + "\n"
+    )
+
+    transcript_md.write_text(transcript_content, encoding="utf-8")
+    analysis_md.write_text(analysis_content, encoding="utf-8")
+
 # ---------- Аудио ----------
 
 def extract_me_and_others(ffmpeg: Path, input_video: Path, out_dir: Path) -> Tuple[Path, Path]:
@@ -297,16 +361,6 @@ CONSISTENCY CONSTRAINT (mandatory):
 - Your band scores, overall band, and "Next focus" MUST be consistent with the FULL REPORT below.
 - Do not contradict the FULL REPORT.
 
-For EACH criterion, provide:
-
-Band score
-
-Main issue to work on (1 line, learning-focused)
-
-Example from the speech (typical error or weakness)
-
-Improved version (how it could sound better)
-
 Output format (strict, compact)
 
 Fluency & Coherence — Band X.X
@@ -363,6 +417,9 @@ def main():
     ffmpeg = Path(config["paths"]["ffmpeg_path"])
     api_key = config["whisper_api"]["api_key"]
 
+    obsidian_sessions_dir_raw = (config.get("paths") or {}).get("obsidian_sessions_dir")
+    obsidian_sessions_dir = Path(obsidian_sessions_dir_raw) if obsidian_sessions_dir_raw else None
+
     tg = get_telegram_settings(config)
     AudioSegment.converter = str(ffmpeg)
 
@@ -370,6 +427,7 @@ def main():
 
     log(f"Watching OBS dir: {obs_dir}")
     log(f"Sessions dir: {sess_root}")
+    log(f"Obsidian sessions dir: {obsidian_sessions_dir if obsidian_sessions_dir else '(not set)'}")
     log(f"Telegram enabled: {bool(tg)}")
 
     while True:
@@ -386,8 +444,11 @@ def main():
             if not is_file_stable(f):
                 continue
 
+            session_folder_name = time.strftime("%Y-%m-%d_%H-%M-%S")
+            session_dt = time.strftime("%Y-%m-%d %H:%M:%S")
+
             log(f"New recording detected: {f.name}")
-            s_dir = sess_root / time.strftime("%Y-%m-%d_%H-%M-%S")
+            s_dir = sess_root / session_folder_name
             s_dir.mkdir(parents=True, exist_ok=True)
             log(f"Session folder created: {s_dir}")
 
@@ -425,6 +486,25 @@ def main():
                 full_path = s_dir / "ai_analysis_report_full.txt"
                 full_path.write_text(full_report, encoding="utf-8")
                 log(f"Full analysis saved: {full_path.name} ({len(full_report)} chars)")
+
+                # ---- Добавлено: сохранение в Obsidian ----
+                if obsidian_sessions_dir:
+                    try:
+                        log("Saving transcript + full analysis to Obsidian (Markdown)")
+                        save_to_obsidian(
+                            obsidian_sessions_dir=obsidian_sessions_dir,
+                            session_folder_name=session_folder_name,
+                            session_dt=session_dt,
+                            source_recording=f.name,
+                            transcript=transcript,
+                            full_report=full_report,
+                        )
+                        log("Saved to Obsidian")
+                    except Exception as e:
+                        log(f"ERROR: Obsidian save failed: {e}")
+                else:
+                    log("Obsidian sessions dir not set; skipping Obsidian save")
+                # ----------------------------------------
 
                 log("Step 7/7: generating SHORT analysis (Telegram)")
                 short_report = analyze_short(api_key, transcript, full_report)
