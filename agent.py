@@ -3,7 +3,7 @@ import time
 import subprocess
 import os
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
 import yaml
 import requests
@@ -12,7 +12,13 @@ from pydub import AudioSegment
 # ---------- Константы ----------
 CHECK_INTERVAL_SECONDS = 2
 CHUNK_LENGTH_MS = 300 * 1000  # 5 минут
-TELEGRAM_SAFE_LIMIT = 3500  # короткий вариант для Telegram
+TELEGRAM_SAFE_LIMIT = 3500  # короткий вариант для Telegram (запас к лимиту ~4096)
+
+# ---------- Логирование ----------
+
+def log(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}")
 
 # ---------- Помощники ----------
 
@@ -108,42 +114,169 @@ def trim_for_telegram(text: str, limit: int) -> str:
         cut = cut[:last_nl]
     return cut.rstrip() + "\n…"
 
-def telegram_send_message(token: str, chat_id: str, text: str):
+def telegram_send_message(token: str, chat_id: str, text: str, use_markdown: bool):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
+    payload: Dict[str, Any] = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True
     }
+    if use_markdown:
+        payload["parse_mode"] = "Markdown"
     r = requests.post(url, json=payload, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f"Telegram error: {r.text[:300]}")
+        raise RuntimeError(f"Telegram error: {r.status_code} {r.text[:300]}")
 
 def get_telegram_settings(config: dict):
     tg = config.get("telegram") or {}
     if not tg.get("enabled"):
         return None
-    return str(tg["bot_token"]), str(tg["chat_id"])
+    token = str(tg.get("bot_token", "")).strip()
+    chat_id = str(tg.get("chat_id", "")).strip()
+    send_md = bool(tg.get("send_analysis_md", True))
+    if not token or not chat_id:
+        return None
+    return {"token": token, "chat_id": chat_id, "send_md": send_md}
 
 # ---------- OpenAI ----------
 
 def transcribe_chunk(api_key: str, chunk_path: Path) -> str:
-    r = requests.post(
-        "https://api.openai.com/v1/audio/transcriptions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        files={"file": (chunk_path.name, chunk_path.open("rb"), "audio/mpeg")},
-        data={"model": "gpt-4o-transcribe", "response_format": "text"},
-        timeout=900
-    )
+    with chunk_path.open("rb") as f:
+        r = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (chunk_path.name, f, "audio/mpeg")},
+            data={"model": "gpt-4o-transcribe", "response_format": "text"},
+            timeout=900
+        )
     if r.status_code != 200:
-        raise RuntimeError("Transcription failed")
+        raise RuntimeError(f"Transcription failed: {r.status_code} {r.text[:300]}")
     return r.text.strip()
 
 def analyze_full(api_key: str, transcript: str) -> str:
-    prompt = f"""You are an IELTS Speaking examiner.
-Respond only in English.
-Provide a FULL detailed evaluation.
+    prompt = f"""
+You are an IELTS Speaking examiner.
+You will be given a transcript and/or audio-based description of one speaker only.
+There is no dialogue context.
+Evaluate the speaker strictly according to IELTS Speaking Band Descriptors.
 
+Important rules:
+
+Assess only what is present in the speaker’s speech.
+
+Do not assume missing abilities.
+
+Use the official 0–9 IELTS band scale (allow .5 scores).
+
+Respond only in English.
+
+Be concise, precise, and analytical.
+
+Evaluation Criteria (all are mandatory)
+1. Fluency and Coherence
+
+Assign a band score (0–9 or .5).
+
+Briefly explain the score.
+
+Provide specific examples of issues or strengths, such as:
+
+long or frequent pauses
+
+hesitation due to word search
+
+repetition or self-correction
+
+weak or effective logical progression
+
+overuse or lack of linking devices
+
+2. Lexical Resource
+
+Assign a band score (0–9 or .5).
+
+Briefly explain the score.
+
+Provide examples from the speech, including:
+
+limited vocabulary or excessive repetition
+
+incorrect word choice or collocation errors
+
+successful or failed paraphrasing
+
+inappropriate use of idiomatic language
+
+precision vs vagueness
+
+3. Grammatical Range and Accuracy
+
+Assign a band score (0–9 or .5).
+
+Briefly explain the score.
+
+Give concrete examples, such as:
+
+frequent basic sentence structures only
+
+errors in tense, agreement, word order, articles, prepositions
+
+attempts at complex structures (relative clauses, conditionals, subordination)
+
+whether errors are systematic or occasional
+
+4. Pronunciation
+
+Assign a band score (0–9 or .5).
+
+Briefly explain the score.
+
+Provide examples or observations, including:
+
+mispronounced sounds that affect understanding
+
+word stress errors
+
+sentence stress and intonation issues
+
+rhythm and connected speech
+
+degree to which accent interferes with intelligibility
+
+Final Results
+
+Overall IELTS Speaking Band Score
+
+Calculate the average of the four criteria.
+
+Round to the nearest 0.5 as per IELTS rules.
+
+Estimated CEFR Level
+
+Map the final band score to CEFR (B1 / B2 / C1 / C2).
+
+Output Format (strict)
+
+Fluency and Coherence: Band X.X
+Explanation: …
+Error / example notes: …
+
+Lexical Resource: Band X.X
+Explanation: …
+Error / example notes: …
+
+Grammatical Range and Accuracy: Band X.X
+Explanation: …
+Error / example notes: …
+
+Pronunciation: Band X.X
+Explanation: …
+Error / example notes: …
+
+Overall IELTS Speaking Band: X.X
+Estimated CEFR Level: …
+
+TRANSCRIPT:
 {transcript}
 """
     r = requests.post(
@@ -157,28 +290,38 @@ Provide a FULL detailed evaluation.
         timeout=180
     )
     if r.status_code != 200:
-        raise RuntimeError("AI full analysis failed")
+        raise RuntimeError(f"AI full analysis failed: {r.status_code} {r.text[:300]}")
     return r.json()["choices"][0]["message"]["content"]
 
-def analyze_short(api_key: str, transcript: str) -> str:
+def analyze_short(api_key: str, transcript: str, full_report: str) -> str:
     prompt = f"""
 You are an IELTS Speaking examiner.
 Respond only in English.
-Keep under 3000 characters.
+Keep the full response under 3000 characters.
+
+You MUST be consistent with the FULL REPORT below:
+- Use the same band scores for each criterion and the same overall band and CEFR.
+- Keep explanations short, but do not contradict the full report.
 
 Output strictly in this format:
 
-🎯 *IELTS Speaking – Short Report*
+🎯 IELTS Speaking — Short Report
 
-🗣 Fluency & Coherence: Band X.X – short explanation and main errors 
-📚 Lexical Resource: Band X.X – short explanation and main errors 
-🧠 Grammar: Band X.X – short explanation and main errors 
-🔊 Pronunciation: Band X.X – short explanation 
+🗣 Fluency & Coherence: Band X.X — one-sentence rationale
+📚 Lexical Resource: Band X.X — one-sentence rationale
+🧠 Grammar: Band X.X — one-sentence rationale
+🔊 Pronunciation: Band X.X — one-sentence rationale
 
-⭐ Overall Band: X.X  
+⭐ Overall Band: X.X
 📈 CEFR: B1 / B2 / C1 / C2
+🧩 Top 2 priorities (next session):
+1) ...
+2) ...
 
-Transcript:
+FULL REPORT:
+{full_report}
+
+TRANSCRIPT (for reference):
 {transcript}
 """
     r = requests.post(
@@ -187,17 +330,18 @@ Transcript:
         json={
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3
+            "temperature": 0.2
         },
         timeout=180
     )
     if r.status_code != 200:
-        raise RuntimeError("AI short analysis failed")
+        raise RuntimeError(f"AI short analysis failed: {r.status_code} {r.text[:300]}")
     return r.json()["choices"][0]["message"]["content"]
 
 # ---------- Main ----------
 
 def main():
+    log("Agent started")
     config = load_config()
 
     obs_dir = Path(config["paths"]["obs_recordings_dir"])
@@ -210,41 +354,85 @@ def main():
 
     seen = set()
 
+    log(f"Watching OBS dir: {obs_dir}")
+    log(f"Sessions dir: {sess_root}")
+    log(f"Telegram enabled: {bool(tg)}")
+
     while True:
-        for f in obs_dir.iterdir():
+        try:
+            files = list(obs_dir.iterdir())
+        except Exception as e:
+            log(f"ERROR: cannot read OBS dir: {e}")
+            pause_and_exit(1)
+
+        for f in files:
             if f.suffix.lower() not in (".mkv", ".mp4") or f in seen:
                 continue
+
             if not is_file_stable(f):
                 continue
 
+            log(f"New recording detected: {f.name}")
             s_dir = sess_root / time.strftime("%Y-%m-%d_%H-%M-%S")
             s_dir.mkdir(parents=True, exist_ok=True)
+            log(f"Session folder created: {s_dir}")
 
-            me_wav, _ = extract_me_and_others(ffmpeg, f, s_dir)
-            clean = clean_me_audio(ffmpeg, me_wav, s_dir)
-            norm = normalize_for_api(ffmpeg, clean, s_dir)
+            try:
+                log("Step 1/7: extracting me.wav and others.wav")
+                me_wav, _others_wav = extract_me_and_others(ffmpeg, f, s_dir)
 
-            texts = []
-            for c in slice_audio(norm):
-                texts.append(transcribe_chunk(api_key, c))
-                c.unlink(missing_ok=True)
+                log("Step 2/7: cleaning me.wav -> me_clean.wav")
+                clean = clean_me_audio(ffmpeg, me_wav, s_dir)
 
-            transcript = "\n\n".join(texts).strip()
-            (s_dir / "transcript_me.txt").write_text(transcript, encoding="utf-8")
+                log("Step 3/7: normalizing for API (mono 16k)")
+                norm = normalize_for_api(ffmpeg, clean, s_dir)
 
-            full_report = analyze_full(api_key, transcript)
-            (s_dir / "ai_analysis_report_full.txt").write_text(full_report, encoding="utf-8")
+                log("Step 4/7: chunking audio")
+                chunks = slice_audio(norm)
+                log(f"Chunks created: {len(chunks)}")
 
-            short_report = analyze_short(api_key, transcript)
+                log("Step 5/7: transcribing chunks")
+                texts: List[str] = []
+                for i, c in enumerate(chunks, start=1):
+                    log(f"  Transcribe chunk {i}/{len(chunks)}: {c.name}")
+                    texts.append(transcribe_chunk(api_key, c))
+                    try:
+                        c.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
-            if tg:
-                telegram_send_message(
-                    tg[0],
-                    tg[1],
-                    trim_for_telegram(short_report, TELEGRAM_SAFE_LIMIT)
-                )
+                transcript = "\n\n".join(texts).strip()
+                transcript_path = s_dir / "transcript_me.txt"
+                transcript_path.write_text(transcript, encoding="utf-8")
+                log(f"Transcript saved: {transcript_path.name} ({len(transcript)} chars)")
 
-            seen.add(f)
+                log("Step 6/7: generating FULL analysis (file)")
+                full_report = analyze_full(api_key, transcript)
+                full_path = s_dir / "ai_analysis_report_full.txt"
+                full_path.write_text(full_report, encoding="utf-8")
+                log(f"Full analysis saved: {full_path.name} ({len(full_report)} chars)")
+
+                log("Step 7/7: generating SHORT analysis (Telegram)")
+                short_report = analyze_short(api_key, transcript, full_report)
+
+                if tg:
+                    msg = trim_for_telegram(short_report, TELEGRAM_SAFE_LIMIT)
+                    log(f"Sending Telegram message ({len(msg)} chars)")
+                    telegram_send_message(
+                        tg["token"],
+                        tg["chat_id"],
+                        msg,
+                        use_markdown=tg["send_md"]
+                    )
+                    log("Telegram message sent")
+                else:
+                    log("Telegram disabled or not configured; skipping send")
+
+                seen.add(f)
+                log("Session completed")
+
+            except Exception as e:
+                log(f"ERROR during processing {f.name}: {e}")
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
