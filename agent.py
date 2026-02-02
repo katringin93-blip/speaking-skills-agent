@@ -438,6 +438,78 @@ TRANSCRIPT (reference only):
         raise RuntimeError(f"AI short analysis failed: {r.status_code} {r.text[:300]}")
     return r.json()["choices"][0]["message"]["content"]
 
+def generate_vocab_drills(api_key: str, transcript: str) -> str:
+    prompt = f"""
+You are a high-end IELTS Speaking coach specializing in lexical development.
+You are given a recording or transcript of a real speaking session (the learner speaking with peers).
+Your task is to design short, targeted vocabulary drills based strictly on what the learner actually said.
+
+You must identify lexical gaps that occur frequently enough to cap the level, not rare or cosmetic issues.
+
+Core Principles (mandatory)
+
+Work only from the learner’s speech data.
+Focus on high-frequency lexical weaknesses, not isolated mistakes.
+Target vocabulary that would make the learner sound:
+- more precise
+- more natural
+- more advanced (C1–C2-leaning)
+
+No grammar drills. No pronunciation drills.
+All exercises must be ≤5 minutes each.
+Respond only in English.
+Keep output Telegram-friendly.
+
+TELEGRAM LENGTH (mandatory):
+- Entire output MUST be under 2800 characters.
+- Prefer 2 drills if 3 would exceed the limit.
+
+Step 1: Lexical Gap Diagnosis
+Briefly identify 3–5 recurring lexical patterns from the session that limit the level.
+For each pattern, specify:
+- What the learner tends to say
+- Why this caps the level
+- What lexical upgrade is needed (not yet the exercise)
+Keep this section short.
+
+Step 2: Vocabulary Upgrade Set
+For each identified gap:
+Propose 5–7 concrete lexical items the learner should add to active vocabulary
+(collocations, verb–noun pairs, precise adjectives, stance verbs, etc.)
+Do NOT give long lists.
+
+Step 3: 5-Minute Lexical Drills (main output)
+Create 2–3 micro-drills, each ≤5 minutes, directly tied to the learner’s real speech.
+
+For EACH drill include:
+🟦 Drill name
+🟦 Purpose
+🟦 Task (what to do)
+🟦 Input examples (use or lightly paraphrase learner’s wording)
+🟦 Target output (upgraded version)
+
+Avoid:
+- fill-in-the-blank grammar tasks
+- memorisation without context
+- textbook-style exercises
+
+TRANSCRIPT:
+{transcript}
+"""
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2
+        },
+        timeout=180
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"AI vocab drills failed: {r.status_code} {r.text[:300]}")
+    return r.json()["choices"][0]["message"]["content"]
+
 # ---------- Main ----------
 
 def main():
@@ -543,16 +615,34 @@ def main():
 
                 if tg:
                     msg = trim_for_telegram(short_report, TELEGRAM_SAFE_LIMIT)
-                    log(f"Sending Telegram message ({len(msg)} chars)")
+                    log(f"Sending Telegram message (analysis) ({len(msg)} chars)")
                     telegram_send_message(
                         tg["token"],
                         tg["chat_id"],
                         msg,
                         use_markdown=tg["send_md"]
                     )
-                    log("Telegram message sent")
+                    log("Telegram analysis message sent")
                 else:
-                    log("Telegram disabled or not configured; skipping send")
+                    log("Telegram disabled or not configured; skipping analysis send")
+
+                # ---- добавлено: упражнения в Telegram ----
+                if tg:
+                    try:
+                        log("Generating vocabulary drills (Telegram)")
+                        drills = generate_vocab_drills(api_key, transcript)
+                        drills_msg = trim_for_telegram(drills, TELEGRAM_SAFE_LIMIT)
+                        log(f"Sending Telegram message (drills) ({len(drills_msg)} chars)")
+                        telegram_send_message(
+                            tg["token"],
+                            tg["chat_id"],
+                            drills_msg,
+                            use_markdown=tg["send_md"]
+                        )
+                        log("Telegram drills message sent")
+                    except Exception as e:
+                        log(f"ERROR: drills generation/sending failed: {e}")
+                # -----------------------------------------
 
                 seen.add(f)
                 log("Session completed")
