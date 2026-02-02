@@ -464,28 +464,18 @@ TELEGRAM LENGTH (mandatory):
 - Entire output MUST be under 2800 characters.
 - Prefer 2 drills if 3 would exceed the limit.
 
-Step 1: Lexical Gap Diagnosis
-Briefly identify 3–5 recurring lexical patterns from the session that limit the level.
-For each pattern, specify:
-- What the learner tends to say
-- Why this caps the level
-- What lexical upgrade is needed (not yet the exercise)
-Keep this section short.
-
-Step 2: Vocabulary Upgrade Set
-For each identified gap:
-Propose 5–7 concrete lexical items the learner should add to active vocabulary
-(collocations, verb–noun pairs, precise adjectives, stance verbs, etc.)
-Do NOT give long lists.
-
-Step 3: 5-Minute Lexical Drills (main output)
+5-Minute Lexical Drills 
 Create 2–3 micro-drills, each ≤5 minutes, directly tied to the learner’s real speech.
 
 For EACH drill include:
 🟦 Drill name
+
 🟦 Purpose
+
 🟦 Task (what to do)
+
 🟦 Input examples (use or lightly paraphrase learner’s wording)
+
 🟦 Target output (upgraded version)
 
 Avoid:
