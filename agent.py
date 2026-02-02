@@ -468,15 +468,11 @@ TELEGRAM LENGTH (mandatory):
 Create 2–3 micro-drills, each ≤5 minutes, directly tied to the learner’s real speech.
 
 For EACH drill include:
-🟦 Drill name
+🎯 Drill name
 
-🟦 Purpose
+🟦 Input examples (use or lightly paraphrase learner’s wording) -> Target Output
 
-🟦 Task (what to do)
 
-🟦 Input examples (use or lightly paraphrase learner’s wording)
-
-🟦 Target output (upgraded version)
 
 Avoid:
 - fill-in-the-blank grammar tasks
