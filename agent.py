@@ -498,6 +498,62 @@ TRANSCRIPT:
 
 # ---------- Main ----------
 
+def extract_topics(api_key: str, transcript: str) -> List[str]:
+    """
+    Extract 3–6 short topics discussed in the session, based strictly on the transcript.
+    Returns a list of short noun phrases.
+    """
+    prompt = f"""
+You are given a transcript of an English speaking practice session.
+
+Task:
+Extract the main topics that were discussed.
+
+Rules (mandatory):
+- Work strictly from the transcript (no guesses).
+- Return 3 to 6 topics.
+- Each topic must be a short noun phrase (2–6 words).
+- No sentences. No punctuation at the end.
+- Respond only in English.
+- Output format: one topic per line (no numbering, no bullets).
+
+TRANSCRIPT:
+{transcript}
+"""
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2
+        },
+        timeout=120
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"AI topics extraction failed: {r.status_code} {r.text[:300]}")
+    text = r.json()["choices"][0]["message"]["content"].strip()
+    topics = []
+    for line in text.splitlines():
+        t = line.strip().lstrip("-•* 	").strip()
+        if not t:
+            continue
+        # keep it short/safe
+        if len(t) > 60:
+            t = t[:60].rstrip()
+        topics.append(t)
+    # de-dup while preserving order
+    seen = set()
+    out = []
+    for t in topics:
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    return out[:6]
+
+
 def main():
     log("Agent started")
     config = load_config()
@@ -534,8 +590,11 @@ def main():
             if not is_file_stable(f):
                 continue
 
-            session_folder_name = time.strftime("%Y-%m-%d_%H-%M-%S")
-            session_dt = time.strftime("%Y-%m-%d %H:%M:%S")
+            # Use the recording file timestamp (mtime) as the factual session date/time
+            rec_ts = f.stat().st_mtime
+            rec_tm = time.localtime(rec_ts)
+            session_folder_name = time.strftime("%Y-%m-%d_%H-%M-%S", rec_tm)
+            session_dt = time.strftime("%Y-%m-%d %H:%M:%S", rec_tm)
 
             log(f"New recording detected: {f.name}")
             s_dir = sess_root / session_folder_name
@@ -573,6 +632,8 @@ def main():
 
                 log("Step 6/7: generating FULL analysis (file)")
                 full_report = analyze_full(api_key, transcript)
+                # Add factual session date (from recording timestamp) into the report text
+                full_report = f"Session date: {session_dt}\n\n" + full_report.strip() + "\n"
                 full_path = s_dir / "ai_analysis_report_full.txt"
                 full_path.write_text(full_report, encoding="utf-8")
                 log(f"Full analysis saved: {full_path.name} ({len(full_report)} chars)")
@@ -598,6 +659,28 @@ def main():
 
                 log("Step 7/7: generating SHORT analysis (Telegram)")
                 short_report = analyze_short(api_key, transcript, full_report)
+                # Add factual session date into the SHORT report (Telegram)
+                try:
+                    short_report = short_report.replace(
+                        "🎯 IELTS Speaking — Session Summary\n",
+                        f"🎯 IELTS Speaking — Session Summary\n📅 Session date: {session_dt}\n",
+                        1,
+                    )
+                except Exception:
+                    pass
+
+                # Extract session topics and append to the end of the SHORT report
+                topics_block = ""
+                try:
+                    topics = extract_topics(api_key, transcript)
+                    if topics:
+                        topics_lines = "\n".join([f"• {t}" for t in topics])
+                        topics_block = "\n\n🗂 Topics discussed:\n" + topics_lines
+                except Exception as e:
+                    log(f"WARNING: topics extraction failed: {e}")
+
+                if topics_block:
+                    short_report = short_report.rstrip() + topics_block + "\n"
 
                 if tg:
                     msg = trim_for_telegram(short_report, TELEGRAM_SAFE_LIMIT)
