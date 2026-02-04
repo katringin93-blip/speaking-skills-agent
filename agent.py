@@ -7,6 +7,10 @@ from typing import List, Tuple, Dict, Any, Optional
 
 import yaml
 import requests
+
+# Shared HTTP client for OpenAI calls (prevents hangs on Windows proxy)
+HTTP = requests.Session()
+HTTP.trust_env = False
 from pydub import AudioSegment
 
 # ---------- Константы ----------
@@ -206,16 +210,71 @@ def get_telegram_settings(config: dict):
 
 def transcribe_chunk(api_key: str, chunk_path: Path) -> str:
     with chunk_path.open("rb") as f:
-        r = requests.post(
+        r = HTTP.post(
             "https://api.openai.com/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {api_key}"},
             files={"file": (chunk_path.name, f, "audio/mpeg")},
             data={"model": "gpt-4o-transcribe", "response_format": "text"},
-            timeout=900
+            timeout=(15, 900)
         )
     if r.status_code != 200:
         raise RuntimeError(f"Transcription failed: {r.status_code} {r.text[:300]}")
     return r.text.strip()
+
+
+def analyze_short(api_key: str, transcript: str, full_report: str) -> str:
+    """
+    Generates a short Telegram-friendly summary of the FULL analysis.
+    Pronunciation is intentionally excluded from the main report; it is handled by a separate module.
+    """
+    prompt = f"""
+You are an English speaking teacher.
+You are given:
+1) The learner transcript (single speaker).
+2) A detailed analysis report (FULL).
+
+Task:
+Write a SHORT Telegram-friendly session summary.
+
+Rules:
+- Respond only in English.
+- Do NOT include any pronunciation evaluation.
+- Keep it concise: target 1200–1800 characters, hard max 2200 characters.
+- Focus on the most important actionable points.
+- Use this exact header line first:
+🎯 IELTS Speaking — Session Summary
+
+Output structure:
+🎯 IELTS Speaking — Session Summary
+• Overall: 1 line
+• Fluency: 1–2 bullets
+• Lexis: 1–2 bullets
+• Grammar: 1–2 bullets
+• Next session focus: 2 bullets (very concrete)
+
+FULL REPORT:
+{full_report}
+
+TRANSCRIPT:
+{transcript}
+"""
+    log("   -> OpenAI: requesting SHORT analysis...")
+    r = HTTP.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2
+        },
+        timeout=(15, 180)
+    )
+    log(f"   -> OpenAI: SHORT analysis response {r.status_code}")
+    if r.status_code != 200:
+        raise RuntimeError(f"AI short analysis failed: {r.status_code} {r.text[:300]}")
+    out = r.json()["choices"][0]["message"]["content"]
+    return (out or "").strip()
+
 
 def analyze_full(api_key: str, transcript: str) -> str:
     # UPDATED PROMPT ONLY
@@ -329,7 +388,8 @@ Exercise 2 (≤5 min): ...
 TRANSCRIPT:
 {transcript}
 """
-    r = requests.post(
+    log("   -> OpenAI: requesting FULL analysis...")
+    r = HTTP.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
@@ -337,8 +397,9 @@ TRANSCRIPT:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3
         },
-        timeout=180
+        timeout=(15, 180)
     )
+    log(f"   -> OpenAI: FULL analysis response {r.status_code}")
     if r.status_code != 200:
         raise RuntimeError(f"AI full analysis failed: {r.status_code} {r.text[:300]}")
     return r.json()["choices"][0]["message"]["content"]
@@ -537,7 +598,8 @@ Transcript (reference):
 {transcript}
 """
 
-    r = requests.post(
+    log("   -> OpenAI: requesting FULL analysis...")
+    r = HTTP.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
@@ -545,8 +607,9 @@ Transcript (reference):
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2
         },
-        timeout=180
+        timeout=(15, 180)
     )
+    log(f"   -> OpenAI: FULL analysis response {r.status_code}")
     if r.status_code != 200:
         raise RuntimeError(f"AI pronunciation module failed: {r.status_code} {r.text[:300]}")
     return r.json()["choices"][0]["message"]["content"]
@@ -618,7 +681,8 @@ Avoid:
 TRANSCRIPT:
 {transcript}
 """
-    r = requests.post(
+    log("   -> OpenAI: requesting FULL analysis...")
+    r = HTTP.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
@@ -626,8 +690,9 @@ TRANSCRIPT:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2
         },
-        timeout=180
+        timeout=(15, 180)
     )
+    log(f"   -> OpenAI: FULL analysis response {r.status_code}")
     if r.status_code != 200:
         raise RuntimeError(f"AI vocab drills failed: {r.status_code} {r.text[:300]}")
     return r.json()["choices"][0]["message"]["content"]
@@ -815,7 +880,7 @@ def analyze_pronunciation_acoustic(api_key: str, wav_path: Path, transcript: str
                 "response_format": "verbose_json",
                 "language": "en",
             }
-            r = requests.post(url, headers=headers, files=files, data=data, timeout=300)
+            r = requests.post(url, headers=headers, files=files, data=data, timeout=(15, 300))
         if r.status_code != 200:
             raise RuntimeError(f"Verbose transcription failed: {r.status_code} {r.text[:300]}")
         return r.json()
@@ -910,14 +975,14 @@ Rules:
             "temperature": 0.2,
             "max_completion_tokens": 600,
         }
-        r = requests.post(
+        r = HTTP.post(
             "https://api.openai.com/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=180,
+            timeout=(15, 180),
         )
         if r.status_code != 200:
             raise RuntimeError(f"Pronunciation audio judge failed: {r.status_code} {r.text[:300]}")
@@ -1080,7 +1145,8 @@ Rules (mandatory):
 TRANSCRIPT:
 {transcript}
 """
-    r = requests.post(
+    log("   -> OpenAI: requesting FULL analysis...")
+    r = HTTP.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
@@ -1088,7 +1154,7 @@ TRANSCRIPT:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2
         },
-        timeout=120
+        timeout=(15, 120)
     )
     if r.status_code != 200:
         raise RuntimeError(f"AI topics extraction failed: {r.status_code} {r.text[:300]}")
@@ -1127,6 +1193,11 @@ def main():
     obsidian_sessions_dir = Path(obsidian_sessions_dir_raw) if obsidian_sessions_dir_raw else None
 
     tg = get_telegram_settings(config)
+
+    # Run mode: when built as .exe, default to processing ONE session and exiting (prevents endless looping).
+    # You can override via config.local.yaml: run_once: false
+    run_once_cfg = (config.get("run_once") if isinstance(config, dict) else None)
+    run_once = bool(run_once_cfg) if run_once_cfg is not None else bool(getattr(sys, "frozen", False))
     AudioSegment.converter = str(ffmpeg)
 
     seen = set()
@@ -1156,6 +1227,7 @@ def main():
             session_folder_name = time.strftime("%Y-%m-%d_%H-%M-%S", rec_tm)
             session_dt = time.strftime("%Y-%m-%d %H:%M:%S", rec_tm)
 
+            seen.add(f)
             log(f"New recording detected: {f.name}")
             s_dir = sess_root / session_folder_name
             s_dir.mkdir(parents=True, exist_ok=True)
@@ -1255,18 +1327,19 @@ def main():
                 else:
                     log("Telegram disabled or not configured; skipping analysis send")
 
-                    # ---- added: separate pronunciation (acoustic) module ----
+                # ---- separate pronunciation (AUDIO) module ----
                 try:
-                    log("Generating Pronunciation (Acoustic) module")
+                    log("Generating Pronunciation (Audio) module")
                     pron_report = analyze_pronunciation_acoustic(api_key, norm, transcript)
+
                     # Save to Obsidian (separate file)
-                    if obs_sessions_dir:
+                    if obsidian_sessions_dir:
                         try:
                             save_pronunciation_to_obsidian(
-                                obsidian_sessions_dir=obs_sessions_dir,
+                                obsidian_sessions_dir=obsidian_sessions_dir,
                                 session_folder_name=session_folder_name,
                                 session_dt=session_dt,
-                                source_recording=str(f),
+                                source_recording=f.name,
                                 pronunciation_report=pron_report,
                             )
                             log("Pronunciation module saved to Obsidian")
@@ -1286,8 +1359,7 @@ def main():
                         log("Telegram pronunciation message sent")
                 except Exception as e:
                     log(f"WARNING: pronunciation module failed: {e}")
-
-                # ---- добавлено: упражнения в Telegram ----
+# ---- добавлено: упражнения в Telegram ----
                 if tg:
                     try:
                         log("Generating vocabulary drills (Telegram)")
@@ -1308,8 +1380,15 @@ def main():
                 seen.add(f)
                 log("Session completed")
 
+                if run_once:
+                    log("Run-once mode: exiting after first completed session")
+                    pause_and_exit(0)
+
             except Exception as e:
                 log(f"ERROR during processing {f.name}: {e}")
+                if run_once:
+                    log("Run-once mode: exiting after error")
+                    pause_and_exit(1)
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
