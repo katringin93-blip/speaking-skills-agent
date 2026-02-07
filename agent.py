@@ -3,6 +3,7 @@ import time
 import subprocess
 import os
 import re
+import json
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -21,11 +22,13 @@ TELEGRAM_SAFE_LIMIT = 3500  # запас к лимиту Telegram ~4096
 
 # Weekly scheduler
 LISBON_TZ = ZoneInfo("Europe/Lisbon")
-WEEKLY_RUN_WEEKDAY = 6  # Sunday (Mon=0 ... Sun=6)
 WEEKLY_RUN_HOUR = 10
 WEEKLY_RUN_MINUTE = 0
 WEEKLY_POLL_SECONDS = 60  # не проверять weekly чаще, чем раз в минуту
-WEEKLY_TELEGRAM_LIMIT = 2800  # PROMPT требует <= 2800
+WEEKLY_TELEGRAM_LIMIT = 2800  # weekly prompt требует <= 2800
+
+# Persistent processed index filename (stored in sessions_dir root)
+PROCESSED_INDEX_FILENAME = ".processed_recordings.json"
 
 
 # ---------- Логирование ----------
@@ -98,6 +101,88 @@ def _yaml_frontmatter(meta: Dict[str, Any]) -> str:
     lines.append("---\n")
     return "\n".join(lines)
 
+def _read_text_safe(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        try:
+            return p.read_text(encoding="utf-8-sig")
+        except Exception:
+            return ""
+
+def _atomic_write_json(path: Path, obj: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+# ---------- Persistent processed index (prevents re-processing on restart) ----------
+
+def _processed_index_path(sess_root: Path) -> Path:
+    return sess_root / PROCESSED_INDEX_FILENAME
+
+def load_processed_index(sess_root: Path) -> Dict[str, Any]:
+    p = _processed_index_path(sess_root)
+    if not p.exists():
+        return {"version": 1, "items": {}}
+    try:
+        data = json.loads(_read_text_safe(p) or "{}")
+        if not isinstance(data, dict):
+            return {"version": 1, "items": {}}
+        if "items" not in data or not isinstance(data["items"], dict):
+            data["items"] = {}
+        if "version" not in data:
+            data["version"] = 1
+        return data
+    except Exception:
+        return {"version": 1, "items": {}}
+
+def save_processed_index(sess_root: Path, data: Dict[str, Any]) -> None:
+    _atomic_write_json(_processed_index_path(sess_root), data)
+
+def make_recording_key(f: Path) -> str:
+    """
+    Stable key for a recording file to avoid re-processing across restarts.
+    Uses absolute path + size + mtime.
+    """
+    try:
+        st = f.stat()
+        return f"{str(f.resolve())}|{st.st_size}|{int(st.st_mtime)}"
+    except Exception:
+        return str(f)
+
+def is_recording_already_processed(
+    f: Path,
+    sess_root: Path,
+    processed_index: Dict[str, Any],
+    session_folder_name: str,
+) -> bool:
+    key = make_recording_key(f)
+    if key in (processed_index.get("items") or {}):
+        return True
+
+    # Fallback safety: if session folder already contains full report, consider processed
+    s_dir = sess_root / session_folder_name
+    if (s_dir / "ai_analysis_report_full.txt").exists():
+        return True
+
+    return False
+
+def mark_recording_processed(
+    f: Path,
+    processed_index: Dict[str, Any],
+    session_folder_name: str,
+) -> None:
+    key = make_recording_key(f)
+    items = processed_index.setdefault("items", {})
+    items[key] = {
+        "session_folder": session_folder_name,
+        "marked_at": datetime.now(tz=LISBON_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+# ---------- Obsidian save ----------
+
 def save_to_obsidian(
     obsidian_sessions_dir: Path,
     session_folder_name: str,
@@ -109,7 +194,7 @@ def save_to_obsidian(
     """
     Создаёт папку сессии в Obsidian и сохраняет 2 Markdown-файла:
       - transcript.md
-      - analysis.md (расширенный)
+      - analysis.md (full)
     """
     target_dir = obsidian_sessions_dir / session_folder_name
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -145,6 +230,32 @@ def save_to_obsidian(
 
     transcript_md.write_text(transcript_content, encoding="utf-8")
     analysis_md.write_text(analysis_content, encoding="utf-8")
+
+def save_topics_to_obsidian(
+    obsidian_sessions_dir: Path,
+    session_folder_name: str,
+    session_dt: str,
+    source_recording: str,
+    topics: List[str],
+):
+    """
+    Сохраняет topics в Obsidian в отдельном файле в папке сессии.
+    """
+    target_dir = obsidian_sessions_dir / session_folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    topics_md = target_dir / "topics.md"
+    meta = {
+        "type": "speaking_session_topics",
+        "date": session_dt,
+        "source_recording": source_recording,
+        "session_folder": session_folder_name,
+    }
+    lines = ["# Topics discussed", ""]
+    for t in topics:
+        lines.append(f"- {t}")
+    content = _yaml_frontmatter(meta) + "\n".join(lines).strip() + "\n"
+    topics_md.write_text(content, encoding="utf-8")
 
 
 # ---------- Аудио ----------
@@ -236,6 +347,7 @@ def transcribe_chunk(api_key: str, chunk_path: Path) -> str:
     return r.text.strip()
 
 def analyze_full(api_key: str, transcript: str) -> str:
+    # Pronunciation REMOVED per requirement
     prompt = f"""
 You are an English speaking teacher and IELTS-style examiner.
 You are given the speech of one speaker only (no dialogue context).
@@ -283,12 +395,6 @@ Focus on:
 - syntactic simplicity that limits expressiveness
 - failed or avoided complex structures
 - errors that undermine perceived control
-
-Pronunciation
-Focus on:
-- prosodic issues affecting meaning
-- misplaced sentence stress
-- intonation that weakens stance or contrast
 
 Final section (mandatory)
 
@@ -342,17 +448,6 @@ Grammar — Band X.X
    Why it hurts: ...
    Better: "..."
 
-Pronunciation — Band X.X
-1) Sounded like: "..."
-   Why it hurts: ...
-   Better target: ...
-2) Sounded like: "..."
-   Why it hurts: ...
-   Better target: ...
-3) Sounded like: "..."
-   Why it hurts: ...
-   Better target: ...
-
 Overall Speaking Band: X.X
 
 Vocabulary Micro-Exercises:
@@ -377,6 +472,7 @@ TRANSCRIPT:
     return r.json()["choices"][0]["message"]["content"]
 
 def analyze_short(api_key: str, transcript: str, full_report: str) -> str:
+    # Pronunciation REMOVED per requirement (no pronunciation section)
     prompt = f"""
 You are an English speaking teacher and IELTS-style examiner.
 
@@ -398,7 +494,7 @@ Selection rules:
 Special requirements:
 - Lexical Resource MUST include 3 incorrect/weak examples and 3 better versions.
 - Grammar MUST include 3 incorrect/weak examples and 3 better versions.
-- Fluency and Pronunciation: 1 example + 1 better version.
+- Fluency: 1 example + 1 better version.
 
 Format strictly as follows:
 
@@ -406,27 +502,22 @@ Format strictly as follows:
 
 🗣 Fluency & Coherence — Band X.X
 Issue: …
-Example: “…” 
-Better: “…”
+Example: “...”
+Better: “...”
 
 📚 Lexical Resource — Band X.X
 Issue: …
 Examples:
-1) “…” → “…”
-2) “…” → “…”
-3) “…” → “…”
+1) “...” → “...”
+2) “...” → “...”
+3) “...” → “...”
 
 🧠 Grammar — Band X.X
 Issue: …
 Examples:
-1) “…” → “…”
-2) “…” → “…”
-3) “…” → “…”
-
-🔊 Pronunciation — Band X.X
-Issue: …
-Example: …
-Better: …
+1) “...” → “...”
+2) “...” → “...”
+3) “...” → “...”
 
 ⭐ Overall Band: X.X
 
@@ -560,7 +651,7 @@ TRANSCRIPT:
     return out[:6]
 
 
-# ---------- Weekly (NEW) ----------
+# ---------- Weekly ----------
 
 _SESSION_DATE_RE = re.compile(r"^Session date:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*$", re.MULTILINE)
 
@@ -601,15 +692,6 @@ def _weekly_obsidian_paths(obsidian_sessions_dir: Path, week_id: str) -> Tuple[P
     weekly_dir.mkdir(parents=True, exist_ok=True)
     return weekly_dir / "weekly.md", weekly_dir / "weekly_telegram.txt"
 
-def _read_text_safe(p: Path) -> str:
-    try:
-        return p.read_text(encoding="utf-8")
-    except Exception:
-        try:
-            return p.read_text(encoding="utf-8-sig")
-        except Exception:
-            return ""
-
 def _collect_full_reports_for_range(sess_root: Path, start_dt: datetime, end_dt: datetime) -> List[Tuple[datetime, Path, str]]:
     out: List[Tuple[datetime, Path, str]] = []
     try:
@@ -630,11 +712,16 @@ def _collect_full_reports_for_range(sess_root: Path, start_dt: datetime, end_dt:
     out.sort(key=lambda x: x[0])
     return out
 
-def _build_weekly_prompt(daily_this_week: List[Tuple[datetime, Path, str]],
-                         daily_prev_week: List[Tuple[datetime, Path, str]],
-                         week_id: str,
-                         week_start: datetime,
-                         week_end: datetime) -> str:
+def _build_weekly_prompt_variant2_vertical(
+    daily_this_week: List[Tuple[datetime, Path, str]],
+    daily_prev_week: List[Tuple[datetime, Path, str]],
+    week_id: str,
+    week_start: datetime,
+    week_end: datetime,
+) -> str:
+    """
+    Variant 2: no table. Daily bands must be listed as bullet lines.
+    """
     def _pack(items: List[Tuple[datetime, Path, str]]) -> str:
         blocks = []
         for dt, _path, txt in items:
@@ -687,11 +774,12 @@ No explanations.
 
 B. Detailed Weekly Report (for Obsidian)
 Include:
-table of daily bands
-weekly averages
-week-to-week comparison
-lexical trends with brief explanations
-short historical notes if patterns persist
+- Daily bands (NO TABLES). Use bullet lines exactly like:
+  - YYYY-MM-DD — F&C X.X | LR X.X | GRA X.X | Overall X.X
+- Weekly averages
+- Week-to-week comparison
+- Lexical trends with brief explanations
+- Short historical notes if patterns persist
 
 OUTPUT FORMAT (STRICT)
 
@@ -714,13 +802,15 @@ PREVIOUS WEEK DAILY REPORTS (for comparison, may be empty):
 """
     return prompt.strip()
 
-def _weekly_generate(api_key: str,
-                     daily_this_week: List[Tuple[datetime, Path, str]],
-                     daily_prev_week: List[Tuple[datetime, Path, str]],
-                     week_id: str,
-                     week_start: datetime,
-                     week_end: datetime) -> Tuple[str, str]:
-    prompt = _build_weekly_prompt(daily_this_week, daily_prev_week, week_id, week_start, week_end)
+def _weekly_generate(
+    api_key: str,
+    daily_this_week: List[Tuple[datetime, Path, str]],
+    daily_prev_week: List[Tuple[datetime, Path, str]],
+    week_id: str,
+    week_start: datetime,
+    week_end: datetime,
+) -> Tuple[str, str]:
+    prompt = _build_weekly_prompt_variant2_vertical(daily_this_week, daily_prev_week, week_id, week_start, week_end)
     r = requests.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -777,14 +867,16 @@ def _update_frontmatter_flag(md_path: Path, key: str, value: str) -> None:
         fm2 = "\n".join(fm_lines)
     md_path.write_text(fm2 + body, encoding="utf-8")
 
-def _weekly_save_to_obsidian(obsidian_sessions_dir: Path,
-                             week_id: str,
-                             week_start: datetime,
-                             week_end: datetime,
-                             detailed_md: str,
-                             telegram_text: str,
-                             telegram_sent: bool,
-                             source_sessions_count: int) -> Tuple[Path, Path]:
+def _weekly_save_to_obsidian(
+    obsidian_sessions_dir: Path,
+    week_id: str,
+    week_start: datetime,
+    week_end: datetime,
+    detailed_md: str,
+    telegram_text: str,
+    telegram_sent: bool,
+    source_sessions_count: int,
+) -> Tuple[Path, Path]:
     weekly_md_path, weekly_tg_path = _weekly_obsidian_paths(obsidian_sessions_dir, week_id)
 
     meta = {
@@ -823,11 +915,9 @@ def weekly_tick(
     tg: Optional[Dict[str, Any]],
 ) -> None:
     """
-    Weekly scheduler:
-    - Runs for due weeks (Sunday 10:00 Lisbon) that were missed.
+    - Runs due weeks (Sunday 10:00 Lisbon) that were missed.
     - Uses Obsidian weekly.md as source-of-truth.
-    - IMPORTANT FIX: does NOT generate weekly if there are 0 daily sessions for that week.
-      (prevents empty weekly reports looping)
+    - Does NOT generate weekly if there are 0 daily sessions for that week.
     - If weekly exists but telegram_sent=false, retries Telegram send (no regeneration).
     """
     if not obsidian_sessions_dir:
@@ -860,7 +950,7 @@ def weekly_tick(
         if exists and tg_sent:
             continue
 
-        # Retry Telegram only (no regeneration)
+        # Retry Telegram only
         if exists and (not tg_sent) and tg:
             weekly_md_path, weekly_tg_path = _weekly_obsidian_paths(obsidian_sessions_dir, week_id)
             msg = _read_text_safe(weekly_tg_path).strip()
@@ -878,10 +968,8 @@ def weekly_tick(
                     log(f"ERROR: Weekly {week_id}: Telegram retry failed: {e}")
             continue
 
-        # Generate weekly ONLY if there is at least 1 daily report in this week
         daily_this = _collect_full_reports_for_range(sess_root, week_start, week_end)
         if len(daily_this) == 0:
-            # ключевой фикс: не создаём пустые weekly вообще
             continue
 
         try:
@@ -942,17 +1030,20 @@ def main():
     tg = get_telegram_settings(config)
     AudioSegment.converter = str(ffmpeg)
 
-    seen = set()
-
     log(f"Watching OBS dir: {obs_dir}")
     log(f"Sessions dir: {sess_root}")
     log(f"Obsidian sessions dir: {obsidian_sessions_dir if obsidian_sessions_dir else '(not set)'}")
     log(f"Telegram enabled: {bool(tg)}")
 
+    # Persistent processed index (prevents reprocessing on restart)
+    processed_index = load_processed_index(sess_root)
+
     # Weekly scheduler throttle
     last_weekly_check = 0.0
 
     while True:
+        processed_any_session_this_loop = False
+
         try:
             files = list(obs_dir.iterdir())
         except Exception as e:
@@ -960,16 +1051,21 @@ def main():
             pause_and_exit(1)
 
         for f in files:
-            if f.suffix.lower() not in (".mkv", ".mp4") or f in seen:
+            if f.suffix.lower() not in (".mkv", ".mp4"):
                 continue
 
             if not is_file_stable(f):
                 continue
 
+            # session name derived from mtime (consistent across restarts)
             rec_ts = f.stat().st_mtime
             rec_tm = time.localtime(rec_ts)
             session_folder_name = time.strftime("%Y-%m-%d_%H-%M-%S", rec_tm)
             session_dt = time.strftime("%Y-%m-%d %H:%M:%S", rec_tm)
+
+            # NEW: skip if already processed (across restarts)
+            if is_recording_already_processed(f, sess_root, processed_index, session_folder_name):
+                continue
 
             log(f"New recording detected: {f.name}")
             s_dir = sess_root / session_folder_name
@@ -1012,6 +1108,22 @@ def main():
                 full_path.write_text(full_report, encoding="utf-8")
                 log(f"Full analysis saved: {full_path.name} ({len(full_report)} chars)")
 
+                # Extract topics once (used for Telegram + saved to Obsidian)
+                topics: List[str] = []
+                try:
+                    topics = extract_topics(api_key, transcript)
+                except Exception as e:
+                    log(f"WARNING: topics extraction failed: {e}")
+                    topics = []
+
+                # save topics to local session folder too (optional but helpful)
+                if topics:
+                    try:
+                        (s_dir / "topics.txt").write_text("\n".join(topics).strip() + "\n", encoding="utf-8")
+                    except Exception:
+                        pass
+
+                # ---- Obsidian save ----
                 if obsidian_sessions_dir:
                     try:
                         log("Saving transcript + full analysis to Obsidian (Markdown)")
@@ -1023,6 +1135,15 @@ def main():
                             transcript=transcript,
                             full_report=full_report,
                         )
+                        if topics:
+                            log("Saving topics to Obsidian (separate file)")
+                            save_topics_to_obsidian(
+                                obsidian_sessions_dir=obsidian_sessions_dir,
+                                session_folder_name=session_folder_name,
+                                session_dt=session_dt,
+                                source_recording=f.name,
+                                topics=topics,
+                            )
                         log("Saved to Obsidian")
                     except Exception as e:
                         log(f"ERROR: Obsidian save failed: {e}")
@@ -1040,16 +1161,10 @@ def main():
                 except Exception:
                     pass
 
-                topics_block = ""
-                try:
-                    topics = extract_topics(api_key, transcript)
-                    if topics:
-                        topics_lines = "\n".join([f"• {t}" for t in topics])
-                        topics_block = "\n\n🗂 Topics discussed:\n" + topics_lines
-                except Exception as e:
-                    log(f"WARNING: topics extraction failed: {e}")
-
-                if topics_block:
+                # Append topics block to Telegram short report (unchanged behavior)
+                if topics:
+                    topics_lines = "\n".join([f"• {t}" for t in topics])
+                    topics_block = "\n\n🗂 Topics discussed:\n" + topics_lines
                     short_report = short_report.rstrip() + topics_block + "\n"
 
                 if tg:
@@ -1065,6 +1180,7 @@ def main():
                 else:
                     log("Telegram disabled or not configured; skipping analysis send")
 
+                # ---- Vocabulary drills in Telegram ----
                 if tg:
                     try:
                         log("Generating vocabulary drills (Telegram)")
@@ -1081,16 +1197,22 @@ def main():
                     except Exception as e:
                         log(f"ERROR: drills generation/sending failed: {e}")
 
-                seen.add(f)
+                # NEW: mark processed persistently (prevents reprocessing on restart)
+                mark_recording_processed(f, processed_index, session_folder_name)
+                save_processed_index(sess_root, processed_index)
+
+                processed_any_session_this_loop = True
                 log("Session completed")
 
             except Exception as e:
                 log(f"ERROR during processing {f.name}: {e}")
 
-        # ---- Weekly tick moved HERE (after processing sessions) ----
+        # ---- Weekly tick AFTER processing sessions ----
         try:
             now_ts = time.time()
             if now_ts - last_weekly_check >= WEEKLY_POLL_SECONDS:
+                # Optional guard: only attempt weekly if there is at least one session processed ever
+                # (still allows weekly retry send even if no new sessions this run)
                 last_weekly_check = now_ts
                 weekly_tick(
                     now=datetime.now(tz=LISBON_TZ),
@@ -1101,7 +1223,7 @@ def main():
                 )
         except Exception as e:
             log(f"ERROR: weekly_tick failed unexpectedly: {e}")
-        # -----------------------------------------------------------
+        # ------------------------------------------------
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
