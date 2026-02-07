@@ -24,11 +24,17 @@ TELEGRAM_SAFE_LIMIT = 3500  # запас к лимиту Telegram ~4096
 LISBON_TZ = ZoneInfo("Europe/Lisbon")
 WEEKLY_RUN_HOUR = 10
 WEEKLY_RUN_MINUTE = 0
-WEEKLY_POLL_SECONDS = 60  # не проверять weekly чаще, чем раз в минуту
-WEEKLY_TELEGRAM_LIMIT = 2800  # weekly prompt требует <= 2800
+WEEKLY_POLL_SECONDS = 60
+WEEKLY_TELEGRAM_LIMIT = 2800
 
 # Persistent processed index filename (stored in sessions_dir root)
 PROCESSED_INDEX_FILENAME = ".processed_recordings.json"
+
+# Telegram inbound polling (for check-in replies)
+TG_UPDATES_POLL_SECONDS = 5
+TG_UPDATES_TIMEOUT_SECONDS = 25
+TG_UPDATES_STATE_FILENAME = ".telegram_updates_state.json"
+TG_CHECKIN_STATE_FILENAME = ".telegram_checkins.json"
 
 
 # ---------- Логирование ----------
@@ -257,6 +263,43 @@ def save_topics_to_obsidian(
     content = _yaml_frontmatter(meta) + "\n".join(lines).strip() + "\n"
     topics_md.write_text(content, encoding="utf-8")
 
+def save_checkin_to_obsidian(
+    obsidian_sessions_dir: Path,
+    session_folder_name: str,
+    session_dt: str,
+    source_recording: str,
+    prompt_message_id: int,
+    reply_message_id: int,
+    reply_text: str,
+):
+    """
+    Сохраняет ответ на чек-ин (recovery/mood) в Obsidian в отдельный файл checkin.md.
+    ВАЖНО: оригинальный voice НЕ сохраняется, только транскрипт/текст.
+    """
+    target_dir = obsidian_sessions_dir / session_folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    p = target_dir / "checkin.md"
+    meta = {
+        "type": "speaking_session_checkin",
+        "date": session_dt,
+        "source_recording": source_recording,
+        "session_folder": session_folder_name,
+        "telegram_prompt_message_id": prompt_message_id,
+        "telegram_reply_message_id": reply_message_id,
+        "saved_at": datetime.now(tz=LISBON_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    body_lines = [
+        "# Post-session check-in",
+        "",
+        "## Response",
+        (reply_text.strip() if reply_text else "").strip(),
+        "",
+    ]
+    content = _yaml_frontmatter(meta) + "\n".join(body_lines).strip() + "\n"
+    p.write_text(content, encoding="utf-8")
+
 
 # ---------- Аудио ----------
 
@@ -306,7 +349,10 @@ def trim_for_telegram(text: str, limit: int) -> str:
         cut = cut[:last_nl]
     return cut.rstrip() + "\n…"
 
-def telegram_send_message(token: str, chat_id: str, text: str, use_markdown: bool):
+def telegram_send_message(token: str, chat_id: str, text: str, use_markdown: bool) -> int:
+    """
+    Returns message_id (callers may ignore).
+    """
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload: Dict[str, Any] = {
         "chat_id": chat_id,
@@ -318,6 +364,49 @@ def telegram_send_message(token: str, chat_id: str, text: str, use_markdown: boo
     r = requests.post(url, json=payload, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"Telegram error: {r.status_code} {r.text[:300]}")
+    data = r.json()
+    return int(data["result"]["message_id"])
+
+def telegram_get_updates(token: str, offset: int) -> Tuple[List[dict], int]:
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    params = {
+        "timeout": TG_UPDATES_TIMEOUT_SECONDS,
+        "offset": offset,
+        "allowed_updates": ["message"],
+    }
+    r = requests.get(url, params=params, timeout=TG_UPDATES_TIMEOUT_SECONDS + 10)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram getUpdates error: {r.status_code} {r.text[:300]}")
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram getUpdates not ok: {str(data)[:300]}")
+    updates = data.get("result") or []
+    if updates:
+        next_offset = max(int(u["update_id"]) for u in updates) + 1
+    else:
+        next_offset = offset
+    return updates, next_offset
+
+def telegram_get_file_path(token: str, file_id: str) -> str:
+    url = f"https://api.telegram.org/bot{token}/getFile"
+    r = requests.get(url, params={"file_id": file_id}, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram getFile error: {r.status_code} {r.text[:300]}")
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram getFile not ok: {str(data)[:300]}")
+    return str(data["result"]["file_path"])
+
+def telegram_download_file(token: str, file_path: str, dest: Path) -> None:
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    with requests.get(url, stream=True, timeout=60) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"Telegram download file error: {r.status_code} {r.text[:200]}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 64):
+                if chunk:
+                    f.write(chunk)
 
 def get_telegram_settings(config: dict):
     tg = config.get("telegram") or {}
@@ -329,6 +418,77 @@ def get_telegram_settings(config: dict):
     if not token or not chat_id:
         return None
     return {"token": token, "chat_id": chat_id, "send_md": send_md}
+
+
+# ---------- Telegram inbound state (check-in) ----------
+
+def _tg_updates_state_path(sess_root: Path) -> Path:
+    return sess_root / TG_UPDATES_STATE_FILENAME
+
+def load_tg_updates_state(sess_root: Path) -> Dict[str, Any]:
+    p = _tg_updates_state_path(sess_root)
+    if not p.exists():
+        return {"version": 1, "offset": 0}
+    try:
+        data = json.loads(_read_text_safe(p) or "{}")
+        if not isinstance(data, dict):
+            return {"version": 1, "offset": 0}
+        if "offset" not in data:
+            data["offset"] = 0
+        return data
+    except Exception:
+        return {"version": 1, "offset": 0}
+
+def save_tg_updates_state(sess_root: Path, state: Dict[str, Any]) -> None:
+    _atomic_write_json(_tg_updates_state_path(sess_root), state)
+
+def _tg_checkins_state_path(sess_root: Path) -> Path:
+    return sess_root / TG_CHECKIN_STATE_FILENAME
+
+def load_tg_checkins(sess_root: Path) -> Dict[str, Any]:
+    p = _tg_checkins_state_path(sess_root)
+    if not p.exists():
+        return {"version": 1, "pending": {}}
+    try:
+        data = json.loads(_read_text_safe(p) or "{}")
+        if not isinstance(data, dict):
+            return {"version": 1, "pending": {}}
+        if "pending" not in data or not isinstance(data["pending"], dict):
+            data["pending"] = {}
+        return data
+    except Exception:
+        return {"version": 1, "pending": {}}
+
+def save_tg_checkins(sess_root: Path, data: Dict[str, Any]) -> None:
+    _atomic_write_json(_tg_checkins_state_path(sess_root), data)
+
+def register_pending_checkin(
+    sess_root: Path,
+    checkins_state: Dict[str, Any],
+    prompt_message_id: int,
+    session_folder_name: str,
+    session_dt: str,
+    source_recording: str,
+) -> None:
+    pending = checkins_state.setdefault("pending", {})
+    pending[str(prompt_message_id)] = {
+        "session_folder": session_folder_name,
+        "session_dt": session_dt,
+        "source_recording": source_recording,
+        "created_at": datetime.now(tz=LISBON_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_tg_checkins(sess_root, checkins_state)
+
+def pop_pending_checkin(
+    sess_root: Path,
+    checkins_state: Dict[str, Any],
+    prompt_message_id: int,
+) -> Optional[Dict[str, Any]]:
+    pending = checkins_state.get("pending") or {}
+    item = pending.pop(str(prompt_message_id), None)
+    if item is not None:
+        save_tg_checkins(sess_root, checkins_state)
+    return item
 
 
 # ---------- OpenAI ----------
@@ -344,6 +504,22 @@ def transcribe_chunk(api_key: str, chunk_path: Path) -> str:
         )
     if r.status_code != 200:
         raise RuntimeError(f"Transcription failed: {r.status_code} {r.text[:300]}")
+    return r.text.strip()
+
+def transcribe_audio_file(api_key: str, audio_path: Path, mime: str) -> str:
+    """
+    For Telegram voice (.ogg) etc. Returns plain text.
+    """
+    with audio_path.open("rb") as f:
+        r = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (audio_path.name, f, mime)},
+            data={"model": "gpt-4o-transcribe", "response_format": "text"},
+            timeout=900
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"Voice transcription failed: {r.status_code} {r.text[:300]}")
     return r.text.strip()
 
 def analyze_full(api_key: str, transcript: str) -> str:
@@ -571,7 +747,7 @@ TELEGRAM LENGTH (mandatory):
 - Entire output MUST be under 2800 characters.
 - Prefer 2 drills if 3 would exceed the limit.
 
-5-Minute Lexical Drills 
+5-Minute Lexical Drills
 Create 2–3 micro-drills, each ≤5 minutes, directly tied to the learner’s real speech.
 
 For EACH drill include:
@@ -721,6 +897,7 @@ def _build_weekly_prompt_variant2_vertical(
 ) -> str:
     """
     Variant 2: no table. Daily bands must be listed as bullet lines.
+    Weekly prompt enriched with emojis (requirement).
     """
     def _pack(items: List[Tuple[datetime, Path, str]]) -> str:
         blocks = []
@@ -746,6 +923,11 @@ Respond only in English
 No teaching, no advice, no exercises
 Only trend analysis
 Be factual and concise
+
+EXTRA REQUIREMENT (mandatory)
+- Enrich the Weekly report with relevant emojis to improve scanability.
+- Emojis must be consistent and not excessive.
+- Use emojis in BOTH outputs (Telegram + Detailed).
 
 Step 1: Aggregate Weekly Metrics
 For each criterion:
@@ -1013,6 +1195,137 @@ def weekly_tick(
             log(f"ERROR: Weekly {week_id}: generation failed: {e}")
 
 
+# ---------- Post-session check-in (Recovery + Mood) ----------
+
+def send_post_session_checkin(tg: Dict[str, Any], session_dt: str) -> int:
+    text = (
+        "🧘 Post-session check-in\n\n"
+        "1) Recovery (0–10)?\n"
+        "2) Mood (0–10 or 1–3 words)?\n\n"
+        "Reply to this message (text or voice)."
+    )
+    return telegram_send_message(tg["token"], tg["chat_id"], text, use_markdown=tg["send_md"])
+
+def telegram_poll_and_process_checkins(
+    *,
+    tg: Optional[Dict[str, Any]],
+    api_key: str,
+    sess_root: Path,
+    obsidian_sessions_dir: Optional[Path],
+    checkins_state: Dict[str, Any],
+    updates_state: Dict[str, Any],
+) -> None:
+    """
+    Polls Telegram updates and saves replies (text or voice) to the correct session folder in Obsidian.
+
+    Matching rule:
+      - user reply must be a reply_to_message of our check-in prompt message_id
+
+    IMPORTANT:
+      - original voice is NOT saved
+      - voice is downloaded to a temp file, transcribed, and then deleted
+      - only the transcript is saved to Obsidian
+    """
+    if not tg or not obsidian_sessions_dir:
+        return
+
+    offset = int(updates_state.get("offset", 0))
+
+    try:
+        updates, next_offset = telegram_get_updates(tg["token"], offset)
+    except Exception as e:
+        log(f"WARNING: Telegram polling failed: {e}")
+        return
+
+    if next_offset != offset:
+        updates_state["offset"] = next_offset
+        save_tg_updates_state(sess_root, updates_state)
+
+    if not updates:
+        return
+
+    pending = checkins_state.get("pending") or {}
+
+    for upd in updates:
+        msg = (upd.get("message") or {})
+        if not msg:
+            continue
+
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id", ""))
+        if chat_id != str(tg["chat_id"]):
+            continue
+
+        reply_to = msg.get("reply_to_message") or {}
+        if not reply_to:
+            continue
+
+        prompt_mid = reply_to.get("message_id")
+        if not prompt_mid:
+            continue
+
+        if str(prompt_mid) not in pending:
+            continue
+
+        item = pop_pending_checkin(sess_root, checkins_state, int(prompt_mid))
+        if not item:
+            continue
+
+        session_folder = item["session_folder"]
+        session_dt = item["session_dt"]
+        source_recording = item["source_recording"]
+
+        reply_mid = int(msg.get("message_id", 0))
+        reply_text = str(msg.get("text") or "").strip()
+
+        voice_transcript = ""
+
+        voice = msg.get("voice")
+        if voice and isinstance(voice, dict) and voice.get("file_id"):
+            try:
+                file_id = str(voice["file_id"])
+                file_path = telegram_get_file_path(tg["token"], file_id)
+
+                tmp_dir = sess_root / ".tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                tmp_voice = tmp_dir / f"checkin_{prompt_mid}_{reply_mid}.ogg"
+
+                telegram_download_file(tg["token"], file_path, tmp_voice)
+
+                try:
+                    voice_transcript = transcribe_audio_file(api_key, tmp_voice, mime="audio/ogg")
+                finally:
+                    try:
+                        tmp_voice.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                log(f"WARNING: failed to transcribe voice check-in: {e}")
+                voice_transcript = ""
+
+        final_text = reply_text
+        if voice_transcript:
+            if final_text:
+                final_text = final_text.rstrip() + "\n\n---\n\n📝 Voice transcript:\n" + voice_transcript
+            else:
+                final_text = "📝 Voice transcript:\n" + voice_transcript
+
+        try:
+            save_checkin_to_obsidian(
+                obsidian_sessions_dir=obsidian_sessions_dir,
+                session_folder_name=session_folder,
+                session_dt=session_dt,
+                source_recording=source_recording,
+                prompt_message_id=int(prompt_mid),
+                reply_message_id=reply_mid,
+                reply_text=final_text,
+            )
+            log(f"Check-in saved to Obsidian for session {session_folder}")
+        except Exception as e:
+            log(f"ERROR: failed to save check-in to Obsidian: {e}")
+
+
 # ---------- Main ----------
 
 def main():
@@ -1035,11 +1348,13 @@ def main():
     log(f"Obsidian sessions dir: {obsidian_sessions_dir if obsidian_sessions_dir else '(not set)'}")
     log(f"Telegram enabled: {bool(tg)}")
 
-    # Persistent processed index (prevents reprocessing on restart)
     processed_index = load_processed_index(sess_root)
 
-    # Weekly scheduler throttle
     last_weekly_check = 0.0
+
+    tg_updates_state = load_tg_updates_state(sess_root)
+    tg_checkins_state = load_tg_checkins(sess_root)
+    last_tg_poll = 0.0
 
     while True:
         processed_any_session_this_loop = False
@@ -1057,13 +1372,11 @@ def main():
             if not is_file_stable(f):
                 continue
 
-            # session name derived from mtime (consistent across restarts)
             rec_ts = f.stat().st_mtime
             rec_tm = time.localtime(rec_ts)
             session_folder_name = time.strftime("%Y-%m-%d_%H-%M-%S", rec_tm)
             session_dt = time.strftime("%Y-%m-%d %H:%M:%S", rec_tm)
 
-            # NEW: skip if already processed (across restarts)
             if is_recording_already_processed(f, sess_root, processed_index, session_folder_name):
                 continue
 
@@ -1108,7 +1421,6 @@ def main():
                 full_path.write_text(full_report, encoding="utf-8")
                 log(f"Full analysis saved: {full_path.name} ({len(full_report)} chars)")
 
-                # Extract topics once (used for Telegram + saved to Obsidian)
                 topics: List[str] = []
                 try:
                     topics = extract_topics(api_key, transcript)
@@ -1116,14 +1428,12 @@ def main():
                     log(f"WARNING: topics extraction failed: {e}")
                     topics = []
 
-                # save topics to local session folder too (optional but helpful)
                 if topics:
                     try:
                         (s_dir / "topics.txt").write_text("\n".join(topics).strip() + "\n", encoding="utf-8")
                     except Exception:
                         pass
 
-                # ---- Obsidian save ----
                 if obsidian_sessions_dir:
                     try:
                         log("Saving transcript + full analysis to Obsidian (Markdown)")
@@ -1161,7 +1471,6 @@ def main():
                 except Exception:
                     pass
 
-                # Append topics block to Telegram short report (unchanged behavior)
                 if topics:
                     topics_lines = "\n".join([f"• {t}" for t in topics])
                     topics_block = "\n\n🗂 Topics discussed:\n" + topics_lines
@@ -1180,7 +1489,6 @@ def main():
                 else:
                     log("Telegram disabled or not configured; skipping analysis send")
 
-                # ---- Vocabulary drills in Telegram ----
                 if tg:
                     try:
                         log("Generating vocabulary drills (Telegram)")
@@ -1197,7 +1505,23 @@ def main():
                     except Exception as e:
                         log(f"ERROR: drills generation/sending failed: {e}")
 
-                # NEW: mark processed persistently (prevents reprocessing on restart)
+                # NEW: post-session check-in prompt
+                if tg:
+                    try:
+                        log("Sending post-session check-in (Recovery + Mood)")
+                        prompt_mid = send_post_session_checkin(tg, session_dt=session_dt)
+                        register_pending_checkin(
+                            sess_root=sess_root,
+                            checkins_state=tg_checkins_state,
+                            prompt_message_id=prompt_mid,
+                            session_folder_name=session_folder_name,
+                            session_dt=session_dt,
+                            source_recording=f.name,
+                        )
+                        log(f"Check-in prompt sent, message_id={prompt_mid}")
+                    except Exception as e:
+                        log(f"ERROR: failed to send check-in prompt: {e}")
+
                 mark_recording_processed(f, processed_index, session_folder_name)
                 save_processed_index(sess_root, processed_index)
 
@@ -1211,8 +1535,6 @@ def main():
         try:
             now_ts = time.time()
             if now_ts - last_weekly_check >= WEEKLY_POLL_SECONDS:
-                # Optional guard: only attempt weekly if there is at least one session processed ever
-                # (still allows weekly retry send even if no new sessions this run)
                 last_weekly_check = now_ts
                 weekly_tick(
                     now=datetime.now(tz=LISBON_TZ),
@@ -1223,6 +1545,23 @@ def main():
                 )
         except Exception as e:
             log(f"ERROR: weekly_tick failed unexpectedly: {e}")
+        # ------------------------------------------------
+
+        # ---- Telegram inbound polling for check-ins ----
+        try:
+            now_ts = time.time()
+            if now_ts - last_tg_poll >= TG_UPDATES_POLL_SECONDS:
+                last_tg_poll = now_ts
+                telegram_poll_and_process_checkins(
+                    tg=tg,
+                    api_key=api_key,
+                    sess_root=sess_root,
+                    obsidian_sessions_dir=obsidian_sessions_dir,
+                    checkins_state=tg_checkins_state,
+                    updates_state=tg_updates_state,
+                )
+        except Exception as e:
+            log(f"WARNING: telegram inbound polling failed: {e}")
         # ------------------------------------------------
 
         time.sleep(CHECK_INTERVAL_SECONDS)
