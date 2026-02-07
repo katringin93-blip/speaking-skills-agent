@@ -13,6 +13,7 @@ import yaml
 import requests
 from pydub import AudioSegment
 
+
 # ---------- Константы ----------
 CHECK_INTERVAL_SECONDS = 2
 CHUNK_LENGTH_MS = 300 * 1000  # 5 минут
@@ -24,7 +25,7 @@ WEEKLY_RUN_WEEKDAY = 6  # Sunday (Mon=0 ... Sun=6)
 WEEKLY_RUN_HOUR = 10
 WEEKLY_RUN_MINUTE = 0
 WEEKLY_POLL_SECONDS = 60  # не проверять weekly чаще, чем раз в минуту
-WEEKLY_TELEGRAM_LIMIT = 2800  # ваш промпт требует <= 2800
+WEEKLY_TELEGRAM_LIMIT = 2800  # PROMPT требует <= 2800
 
 
 # ---------- Логирование ----------
@@ -235,7 +236,6 @@ def transcribe_chunk(api_key: str, chunk_path: Path) -> str:
     return r.text.strip()
 
 def analyze_full(api_key: str, transcript: str) -> str:
-    # UPDATED PROMPT ONLY
     prompt = f"""
 You are an English speaking teacher and IELTS-style examiner.
 You are given the speech of one speaker only (no dialogue context).
@@ -377,7 +377,6 @@ TRANSCRIPT:
     return r.json()["choices"][0]["message"]["content"]
 
 def analyze_short(api_key: str, transcript: str, full_report: str) -> str:
-    # UPDATED PROMPT ONLY (Lexical: 3 examples; Grammar: 3 examples)
     prompt = f"""
 You are an English speaking teacher and IELTS-style examiner.
 
@@ -407,7 +406,7 @@ Format strictly as follows:
 
 🗣 Fluency & Coherence — Band X.X
 Issue: …
-Example: “…”
+Example: “…” 
 Better: “…”
 
 📚 Lexical Resource — Band X.X
@@ -489,8 +488,6 @@ For EACH drill include:
 
 🟦 Input examples (use or lightly paraphrase learner’s wording) -> Target Output
 
-
-
 Avoid:
 - fill-in-the-blank grammar tasks
 - memorisation without context
@@ -514,10 +511,6 @@ TRANSCRIPT:
     return r.json()["choices"][0]["message"]["content"]
 
 def extract_topics(api_key: str, transcript: str) -> List[str]:
-    """
-    Extract 3–6 short topics discussed in the session, based strictly on the transcript.
-    Returns a list of short noun phrases.
-    """
     prompt = f"""
 You are given a transcript of an English speaking practice session.
 
@@ -576,22 +569,16 @@ def _parse_session_dt_from_full_report(text: str) -> Optional[datetime]:
     if not m:
         return None
     try:
-        # Interpreting as Lisbon local time
         dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
         return dt.replace(tzinfo=LISBON_TZ)
     except Exception:
         return None
 
 def _week_id(dt: datetime) -> str:
-    # ISO week, e.g., 2026-W05
     iso_year, iso_week, _ = dt.isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
 
 def _week_bounds_for_anchor(dt: datetime) -> Tuple[datetime, datetime]:
-    """
-    Returns (week_start, week_end) for the ISO week containing dt,
-    in Lisbon TZ. week_end is inclusive end-of-week (Sunday 23:59:59).
-    """
     d = dt.astimezone(LISBON_TZ).date()
     monday = d - timedelta(days=d.weekday())
     week_start = datetime(monday.year, monday.month, monday.day, 0, 0, 0, tzinfo=LISBON_TZ)
@@ -600,20 +587,11 @@ def _week_bounds_for_anchor(dt: datetime) -> Tuple[datetime, datetime]:
     return week_start, week_end
 
 def _last_due_week_anchor(now: datetime) -> Optional[datetime]:
-    """
-    Returns an anchor datetime within the last week that is due to be generated,
-    based on Sunday 10:00 Lisbon.
-    If it's not yet Sunday 10:00 of current week, returns previous week's anchor.
-    If we want to generate multiple missed weeks, we will walk forward using anchors.
-    """
     now = now.astimezone(LISBON_TZ)
-    # Find the most recent Sunday 10:00 that is <= now
-    # Compute current week's Sunday date:
     d = now.date()
     sunday = d + timedelta(days=(6 - d.weekday()))
     candidate = datetime(sunday.year, sunday.month, sunday.day, WEEKLY_RUN_HOUR, WEEKLY_RUN_MINUTE, 0, tzinfo=LISBON_TZ)
     if candidate > now:
-        # go to previous week's Sunday 10:00
         prev_sunday = sunday - timedelta(days=7)
         candidate = datetime(prev_sunday.year, prev_sunday.month, prev_sunday.day, WEEKLY_RUN_HOUR, WEEKLY_RUN_MINUTE, 0, tzinfo=LISBON_TZ)
     return candidate
@@ -633,23 +611,22 @@ def _read_text_safe(p: Path) -> str:
             return ""
 
 def _collect_full_reports_for_range(sess_root: Path, start_dt: datetime, end_dt: datetime) -> List[Tuple[datetime, Path, str]]:
-    """
-    Returns list of (session_dt, report_path, report_text) in [start_dt, end_dt] Lisbon time.
-    Uses ai_analysis_report_full.txt and parses Session date: line.
-    """
     out: List[Tuple[datetime, Path, str]] = []
-    for sdir in sorted(sess_root.iterdir()):
-        if not sdir.is_dir():
-            continue
-        rp = sdir / "ai_analysis_report_full.txt"
-        if not rp.exists():
-            continue
-        txt = _read_text_safe(rp)
-        sdt = _parse_session_dt_from_full_report(txt)
-        if not sdt:
-            continue
-        if start_dt <= sdt <= end_dt:
-            out.append((sdt, rp, txt))
+    try:
+        for sdir in sorted(sess_root.iterdir()):
+            if not sdir.is_dir():
+                continue
+            rp = sdir / "ai_analysis_report_full.txt"
+            if not rp.exists():
+                continue
+            txt = _read_text_safe(rp)
+            sdt = _parse_session_dt_from_full_report(txt)
+            if not sdt:
+                continue
+            if start_dt <= sdt <= end_dt:
+                out.append((sdt, rp, txt))
+    except Exception:
+        return []
     out.sort(key=lambda x: x[0])
     return out
 
@@ -658,7 +635,6 @@ def _build_weekly_prompt(daily_this_week: List[Tuple[datetime, Path, str]],
                          week_id: str,
                          week_start: datetime,
                          week_end: datetime) -> str:
-    # Weekly prompt (kept in code as requested)
     def _pack(items: List[Tuple[datetime, Path, str]]) -> str:
         blocks = []
         for dt, _path, txt in items:
@@ -679,79 +655,42 @@ Each daily report includes band scores and identified lexical issues.
 Your task is to produce a weekly trend report that shows direction of progress, not coaching.
 
 Rules
-
 Respond only in English
-
 No teaching, no advice, no exercises
-
 Only trend analysis
-
 Be factual and concise
 
-Output must support:
-
-a very short Telegram summary
-
-a detailed version for long-term tracking
-
 Step 1: Aggregate Weekly Metrics
-
 For each criterion:
-
 Fluency & Coherence
-
 Lexical Resource
-
 Grammatical Range & Accuracy
-
 Calculate:
-
 weekly average band
-
 comparison vs previous week (↑ / → / ↓)
-
 If there is NO previous-week data, use "n/a" instead of arrows.
 
 Step 2: Lexical Trend Analysis
-
 Identify:
-
-Top recurring lexical gaps of the week
-(based on frequency across daily sessions)
-
-Persistent lexical blockers
-(patterns repeating across multiple weeks)
-
-Resolved or reduced lexical issues
-(previously frequent, now rare or absent)
-
+Top recurring lexical gaps of the week (based on frequency across daily sessions)
+Persistent lexical blockers (patterns repeating across multiple weeks)
+Resolved or reduced lexical issues (previously frequent, now rare or absent)
 Focus only on high-impact lexical patterns that affect speaking level.
 
 Step 3: Produce Two Outputs
 A. Telegram Summary (ultra-short)
-
 Include:
-
 weekly average band per criterion
-
 trend direction (↑ → ↓ or n/a)
-
 2–3 key lexical trend bullets
-
 No explanations.
 
 B. Detailed Weekly Report (for Obsidian)
-
 Include:
-
 table of daily bands
-
 weekly averages
-
 week-to-week comparison
-
 lexical trends with brief explanations
-
 short historical notes if patterns persist
 
 OUTPUT FORMAT (STRICT)
@@ -768,7 +707,7 @@ week_start: {week_start.strftime("%Y-%m-%d")}
 week_end: {week_end.strftime("%Y-%m-%d")}
 
 THIS WEEK DAILY REPORTS:
-{this_block if this_block else "(no sessions this week)"}
+{this_block}
 
 PREVIOUS WEEK DAILY REPORTS (for comparison, may be empty):
 {prev_block if prev_block else "(no previous-week baseline)"}
@@ -796,7 +735,6 @@ def _weekly_generate(api_key: str,
         raise RuntimeError(f"AI weekly analysis failed: {r.status_code} {r.text[:300]}")
     text = r.json()["choices"][0]["message"]["content"]
 
-    # Split by strict markers
     def _extract(section: str) -> str:
         m = re.search(rf"^===\s*{re.escape(section)}\s*===\s*$", text, flags=re.MULTILINE)
         if not m:
@@ -811,39 +749,30 @@ def _weekly_generate(api_key: str,
     detailed = _extract("DETAILED")
 
     if not telegram or not detailed:
-        # fallback: treat whole text as detailed, telegram empty
         detailed = text.strip()
         telegram = ""
 
     return telegram, detailed
 
 def _update_frontmatter_flag(md_path: Path, key: str, value: str) -> None:
-    """
-    Updates (or inserts) key: value within YAML frontmatter at the top of a markdown file.
-    Assumes frontmatter starts at first line '---' and ends at next '---'.
-    """
     raw = _read_text_safe(md_path)
     if not raw.startswith("---"):
-        # no frontmatter, prepend minimal one
         raw = "---\n" + f"{key}: {value}\n" + "---\n\n" + raw
         md_path.write_text(raw, encoding="utf-8")
         return
 
     end = raw.find("\n---", 3)
     if end == -1:
-        # broken frontmatter; just prepend new one
         raw = "---\n" + f"{key}: {value}\n" + "---\n\n" + raw
         md_path.write_text(raw, encoding="utf-8")
         return
 
-    fm = raw[0:end+4]  # includes '\n---'
+    fm = raw[0:end+4]
     body = raw[end+4:]
-    # replace or insert
     if re.search(rf"(?m)^{re.escape(key)}\s*:\s*.*$", fm):
         fm2 = re.sub(rf"(?m)^{re.escape(key)}\s*:\s*.*$", f"{key}: {value}", fm)
     else:
         fm_lines = fm.splitlines()
-        # insert before closing ---
         fm_lines.insert(-1, f"{key}: {value}")
         fm2 = "\n".join(fm_lines)
     md_path.write_text(fm2 + body, encoding="utf-8")
@@ -876,10 +805,6 @@ def _weekly_save_to_obsidian(obsidian_sessions_dir: Path,
     return weekly_md_path, weekly_tg_path
 
 def _weekly_is_done(obsidian_sessions_dir: Path, week_id: str) -> Tuple[bool, bool]:
-    """
-    Returns (exists, telegram_sent_flag).
-    If exists but telegram_sent=false -> will retry send without regenerating.
-    """
     weekly_md_path, _weekly_tg_path = _weekly_obsidian_paths(obsidian_sessions_dir, week_id)
     if not weekly_md_path.exists():
         return (False, False)
@@ -899,8 +824,10 @@ def weekly_tick(
 ) -> None:
     """
     Weekly scheduler:
-    - Runs for any due weeks (Sunday 10:00 Lisbon) that were missed.
-    - Uses Obsidian weekly.md as the source-of-truth flag.
+    - Runs for due weeks (Sunday 10:00 Lisbon) that were missed.
+    - Uses Obsidian weekly.md as source-of-truth.
+    - IMPORTANT FIX: does NOT generate weekly if there are 0 daily sessions for that week.
+      (prevents empty weekly reports looping)
     - If weekly exists but telegram_sent=false, retries Telegram send (no regeneration).
     """
     if not obsidian_sessions_dir:
@@ -911,14 +838,11 @@ def weekly_tick(
     if not last_due:
         return
 
-    # We'll attempt to generate for all weeks from some reasonable past point up to last_due.
-    # To avoid scanning "forever", we look back max 12 weeks for missed reports.
+    # look back max 12 weeks
     start_anchor = last_due - timedelta(weeks=12)
 
-    # Build list of Sunday 10:00 anchors from start_anchor..last_due
     anchors: List[datetime] = []
     a = start_anchor
-    # normalize a to nearest previous Sunday 10:00
     d = a.date()
     sunday = d + timedelta(days=(6 - d.weekday()))
     a = datetime(sunday.year, sunday.month, sunday.day, WEEKLY_RUN_HOUR, WEEKLY_RUN_MINUTE, 0, tzinfo=LISBON_TZ)
@@ -929,7 +853,6 @@ def weekly_tick(
         a += timedelta(weeks=1)
 
     for anchor in anchors:
-        # This weekly report is for the ISO week containing 'anchor' Sunday.
         week_start, week_end = _week_bounds_for_anchor(anchor)
         week_id = _week_id(anchor)
 
@@ -937,23 +860,31 @@ def weekly_tick(
         if exists and tg_sent:
             continue
 
-        # If exists but telegram not sent -> retry sending from saved weekly_telegram.txt
+        # Retry Telegram only (no regeneration)
         if exists and (not tg_sent) and tg:
             weekly_md_path, weekly_tg_path = _weekly_obsidian_paths(obsidian_sessions_dir, week_id)
             msg = _read_text_safe(weekly_tg_path).strip()
             if msg:
                 try:
                     log(f"Weekly {week_id}: retrying Telegram send")
-                    telegram_send_message(tg["token"], tg["chat_id"], trim_for_telegram(msg, TELEGRAM_SAFE_LIMIT), use_markdown=tg["send_md"])
+                    telegram_send_message(
+                        tg["token"], tg["chat_id"],
+                        trim_for_telegram(msg, TELEGRAM_SAFE_LIMIT),
+                        use_markdown=tg["send_md"]
+                    )
                     _update_frontmatter_flag(weekly_md_path, "telegram_sent", "true")
                     log(f"Weekly {week_id}: Telegram sent (retry) and marked telegram_sent=true")
                 except Exception as e:
                     log(f"ERROR: Weekly {week_id}: Telegram retry failed: {e}")
             continue
 
-        # Generate weekly
+        # Generate weekly ONLY if there is at least 1 daily report in this week
+        daily_this = _collect_full_reports_for_range(sess_root, week_start, week_end)
+        if len(daily_this) == 0:
+            # ключевой фикс: не создаём пустые weekly вообще
+            continue
+
         try:
-            daily_this = _collect_full_reports_for_range(sess_root, week_start, week_end)
             prev_start = week_start - timedelta(days=7)
             prev_end = week_end - timedelta(days=7)
             daily_prev = _collect_full_reports_for_range(sess_root, prev_start, prev_end)
@@ -965,7 +896,6 @@ def weekly_tick(
             if telegram_text:
                 telegram_text = trim_for_telegram(telegram_text, WEEKLY_TELEGRAM_LIMIT)
 
-            # Save to Obsidian first with telegram_sent=false
             weekly_md_path, _weekly_tg_path = _weekly_save_to_obsidian(
                 obsidian_sessions_dir=obsidian_sessions_dir,
                 week_id=week_id,
@@ -978,13 +908,11 @@ def weekly_tick(
             )
             log(f"Weekly {week_id}: saved to Obsidian: {weekly_md_path}")
 
-            # Send Telegram if configured
             if tg and telegram_text:
                 try:
                     log(f"Weekly {week_id}: sending Telegram summary")
                     telegram_send_message(
-                        tg["token"],
-                        tg["chat_id"],
+                        tg["token"], tg["chat_id"],
                         trim_for_telegram(telegram_text, TELEGRAM_SAFE_LIMIT),
                         use_markdown=tg["send_md"]
                     )
@@ -1021,25 +949,10 @@ def main():
     log(f"Obsidian sessions dir: {obsidian_sessions_dir if obsidian_sessions_dir else '(not set)'}")
     log(f"Telegram enabled: {bool(tg)}")
 
-    # NEW: weekly scheduler throttle
+    # Weekly scheduler throttle
     last_weekly_check = 0.0
 
     while True:
-        # NEW: weekly tick (throttled)
-        try:
-            now_ts = time.time()
-            if now_ts - last_weekly_check >= WEEKLY_POLL_SECONDS:
-                last_weekly_check = now_ts
-                weekly_tick(
-                    now=datetime.now(tz=LISBON_TZ),
-                    api_key=api_key,
-                    sess_root=sess_root,
-                    obsidian_sessions_dir=obsidian_sessions_dir,
-                    tg=tg,
-                )
-        except Exception as e:
-            log(f"ERROR: weekly_tick failed unexpectedly: {e}")
-
         try:
             files = list(obs_dir.iterdir())
         except Exception as e:
@@ -1053,7 +966,6 @@ def main():
             if not is_file_stable(f):
                 continue
 
-            # Use the recording file timestamp (mtime) as the factual session date/time
             rec_ts = f.stat().st_mtime
             rec_tm = time.localtime(rec_ts)
             session_folder_name = time.strftime("%Y-%m-%d_%H-%M-%S", rec_tm)
@@ -1095,13 +1007,11 @@ def main():
 
                 log("Step 6/7: generating FULL analysis (file)")
                 full_report = analyze_full(api_key, transcript)
-                # Add factual session date (from recording timestamp) into the report text
                 full_report = f"Session date: {session_dt}\n\n" + full_report.strip() + "\n"
                 full_path = s_dir / "ai_analysis_report_full.txt"
                 full_path.write_text(full_report, encoding="utf-8")
                 log(f"Full analysis saved: {full_path.name} ({len(full_report)} chars)")
 
-                # ---- сохранение в Obsidian ----
                 if obsidian_sessions_dir:
                     try:
                         log("Saving transcript + full analysis to Obsidian (Markdown)")
@@ -1118,11 +1028,9 @@ def main():
                         log(f"ERROR: Obsidian save failed: {e}")
                 else:
                     log("Obsidian sessions dir not set; skipping Obsidian save")
-                # -------------------------------
 
                 log("Step 7/7: generating SHORT analysis (Telegram)")
                 short_report = analyze_short(api_key, transcript, full_report)
-                # Add factual session date into the SHORT report (Telegram)
                 try:
                     short_report = short_report.replace(
                         "🎯 IELTS Speaking — Session Summary\n",
@@ -1132,7 +1040,6 @@ def main():
                 except Exception:
                     pass
 
-                # Extract session topics and append to the end of the SHORT report
                 topics_block = ""
                 try:
                     topics = extract_topics(api_key, transcript)
@@ -1158,7 +1065,6 @@ def main():
                 else:
                     log("Telegram disabled or not configured; skipping analysis send")
 
-                # ---- добавлено: упражнения в Telegram ----
                 if tg:
                     try:
                         log("Generating vocabulary drills (Telegram)")
@@ -1174,7 +1080,6 @@ def main():
                         log("Telegram drills message sent")
                     except Exception as e:
                         log(f"ERROR: drills generation/sending failed: {e}")
-                # -----------------------------------------
 
                 seen.add(f)
                 log("Session completed")
@@ -1182,7 +1087,24 @@ def main():
             except Exception as e:
                 log(f"ERROR during processing {f.name}: {e}")
 
+        # ---- Weekly tick moved HERE (after processing sessions) ----
+        try:
+            now_ts = time.time()
+            if now_ts - last_weekly_check >= WEEKLY_POLL_SECONDS:
+                last_weekly_check = now_ts
+                weekly_tick(
+                    now=datetime.now(tz=LISBON_TZ),
+                    api_key=api_key,
+                    sess_root=sess_root,
+                    obsidian_sessions_dir=obsidian_sessions_dir,
+                    tg=tg,
+                )
+        except Exception as e:
+            log(f"ERROR: weekly_tick failed unexpectedly: {e}")
+        # -----------------------------------------------------------
+
         time.sleep(CHECK_INTERVAL_SECONDS)
+
 
 if __name__ == "__main__":
     main()
