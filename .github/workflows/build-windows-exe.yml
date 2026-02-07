@@ -25,7 +25,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Build exe
-        run: pyinstaller --onefile --name SpeakingSkillsAgent agent.py
+        run: pyinstaller --onefile --name SpeakingSkillsAgent agent.py --hidden-import tzdata --collect-all tzdata
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
